@@ -1,0 +1,12 @@
+# Build artifacts
+cvisor
+src/*.o
+tests/*
+!tests/*.c
+
+# CMake / CLion
+cmake-build-*/
+.idea/
+
+# macOS
+.DS_Store
