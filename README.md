@@ -35,23 +35,11 @@ SIGSEGV, you land in the TUI at the recording of its final moments.
 
 ### On an Apple Silicon Mac
 
-The tool cannot run natively on macOS/arm64. This repo ships a preconfigured
-x86-64 Debian VM (`vm/lima-cvisor.yaml`) that mounts the project directory:
-
-```sh
-# one-time setup (already done on this machine):
-#   brew install lima lima-additional-guestagents
-#   limactl create --name=cvisor vm/lima-cvisor.yaml
-limactl start cvisor          # boot (a few minutes; emulated via QEMU TCG)
-limactl shell cvisor          # enter the VM — uname -m says x86_64
-cd /Users/<you>/CLionProjects/OSpre   # the project dir, mounted read-write
-make && make tests
-./cvisor tests/factorial      # TUI opens right in your terminal
-limactl stop cvisor           # when done (it keeps running otherwise)
-```
-
-Edit code on the Mac, build and run inside the VM shell. Note: Docker with
-Rosetta can compile the code but **cannot record** (Rosetta does not support
+The tool cannot run natively on macOS/arm64. Use an x86-64 Linux VM under
+full-system emulation (e.g. [Lima](https://lima-vm.io) or UTM with QEMU TCG,
+`arch: x86_64`) that mounts the project directory — edit code on the Mac,
+build and run inside the VM shell. Note: Docker with Rosetta can compile the
+code but **cannot record** (Rosetta does not support
 `PTRACE_SINGLESTEP`/`GETREGS`); a real or emulated x86-64 kernel is required.
 A native x86-64 Linux server over ssh works best if you have one.
 
@@ -144,7 +132,6 @@ src/recorder.c  ptrace engine: fork+TRACEME+ASLR off, SINGLESTEP loop, snapshots
 src/trace.c     trace storage, binary-search lookups, register/syscall tables
 src/tui.c       ncurses panels, overlays, status bar
 src/main.c      option parsing and orchestration
-vm/             Lima VM config for Apple Silicon development
 tests/          example/verification programs
 ```
 
@@ -179,22 +166,10 @@ TUI에 진입해 `End` → `←`로 원인을 거슬러 올라갈 수 있습니�
 
 ### Apple Silicon 맥에서
 
-macOS/arm64에서는 네이티브 실행이 불가능합니다. 이 저장소에는 프로젝트 폴더를
-그대로 마운트하는 x86-64 Debian VM 설정(`vm/lima-cvisor.yaml`)이 들어 있습니다:
-
-```sh
-# 최초 1회 (이 맥에는 이미 설정됨):
-#   brew install lima lima-additional-guestagents
-#   limactl create --name=cvisor vm/lima-cvisor.yaml
-limactl start cvisor          # VM 부팅 (QEMU 에뮬레이션이라 몇 분)
-limactl shell cvisor          # VM 셸 진입 — uname -m 이 x86_64
-cd /Users/<사용자>/CLionProjects/OSpre   # 맥 프로젝트 폴더가 그대로 보임
-make && make tests
-./cvisor tests/factorial      # TUI가 현재 터미널에 뜸
-limactl stop cvisor           # 다 쓰면 정지 (안 끄면 계속 돎)
-```
-
-코드는 맥에서 편집하고, 빌드/실행은 VM 셸에서 하면 됩니다. 참고: Docker+Rosetta는
+macOS/arm64에서는 네이티브 실행이 불가능합니다. 프로젝트 폴더를 마운트하는
+x86-64 리눅스 VM([Lima](https://lima-vm.io)나 UTM의 QEMU 전체 에뮬레이션,
+`arch: x86_64`)을 사용하세요 — 코드는 맥에서 편집하고, 빌드/실행은 VM 셸에서
+하면 됩니다. 참고: Docker+Rosetta는
 컴파일은 되지만 `PTRACE_SINGLESTEP`을 지원하지 않아 **기록이 불가능**합니다.
 학교/연구실의 진짜 x86-64 리눅스 서버가 있다면 그쪽이 가장 빠릅니다.
 
@@ -284,7 +259,6 @@ src/recorder.c  ptrace 엔진: fork+TRACEME+ASLR off, SINGLESTEP 루프, 스냅�
 src/trace.c     트레이스 저장, 이진탐색 조회, 레지스터/시스템콜 테이블
 src/tui.c       ncurses 패널·오버레이·상태바
 src/main.c      옵션 파싱 및 오케스트레이션
-vm/             Apple Silicon 개발용 Lima VM 설정
 tests/          예제/검증 프로그램
 ```
 
