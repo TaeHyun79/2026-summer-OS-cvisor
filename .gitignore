@@ -8,5 +8,8 @@ tests/*
 cmake-build-*/
 .idea/
 
+# Local VM config
+vm/
+
 # macOS
 .DS_Store
