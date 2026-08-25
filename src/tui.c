@@ -33,7 +33,8 @@ enum {
 
 typedef struct {
     trace_t *t;
-    size_t   cur;
+    int      proc;                  /* current process (proc index) */
+    size_t   cur;                   /* step index within that process */
     int      mode_src;              /* 0 = instruction step, 1 = source step */
     int      mem_pane;
     int      mem_scroll[PANE_N];    /* row offset per memory pane */
@@ -47,10 +48,18 @@ typedef struct {
 
 /* ---------------- helpers ---------------- */
 
-static const step_t *cur_step(ui_t *u)  { return &u->t->steps[u->cur]; }
+static const proc_t *cur_proc(ui_t *u) { return &u->t->procs[u->proc]; }
+static const step_t *cur_step(ui_t *u)
+{
+    return &cur_proc(u)->steps[u->cur];
+}
 static const step_t *prev_step(ui_t *u)
 {
-    return &u->t->steps[u->cur > 0 ? u->cur - 1 : 0];
+    return &cur_proc(u)->steps[u->cur > 0 ? u->cur - 1 : 0];
+}
+static const image_t *cur_img(ui_t *u)
+{
+    return u->t->images[cur_step(u)->img];
 }
 
 /* fetch the byte at absolute address `addr` from a step's snapshots */
@@ -69,9 +78,10 @@ static int step_byte(const trace_t *t, const step_t *s, uint64_t addr,
             return 0;
         }
     }
-    if (s->globals && addr >= t->globals_rng.start &&
-        addr < t->globals_rng.start + s->globals_len) {
-        *out = s->globals[addr - t->globals_rng.start];
+    const image_t *im = t->images[s->img];
+    if (s->globals && addr >= im->globals_rng.start &&
+        addr < im->globals_rng.start + s->globals_len) {
+        *out = s->globals[addr - im->globals_rng.start];
         return 0;
     }
     return -1;
@@ -111,16 +121,16 @@ static int center_first(int pos, int total, int visible)
 
 static void draw_src(ui_t *u)
 {
-    trace_t *t = u->t;
+    const image_t *im = cur_img(u);
     char title[600];
     snprintf(title, sizeof(title), "%s",
-             t->src_file[0] ? t->src_file : "source");
+             im->src_file[0] ? im->src_file : "source");
     draw_frame(u->wsrc, title);
 
     int h = getmaxy(u->wsrc) - 2, w = getmaxx(u->wsrc) - 2;
     if (h <= 0)
         return;
-    if (t->n_src == 0) {
+    if (im->n_src == 0) {
         mvwprintw(u->wsrc, 1, 2, "(source not available)");
         wnoutrefresh(u->wsrc);
         return;
@@ -128,16 +138,16 @@ static void draw_src(ui_t *u)
 
     int cur_line = cur_step(u)->src_line; /* 1-based, -1 = none */
     int pos = (cur_line > 0 ? cur_line : 1) - 1;
-    int first = center_first(pos, t->n_src, h);
+    int first = center_first(pos, im->n_src, h);
 
-    for (int i = 0; i < h && first + i < t->n_src; i++) {
+    for (int i = 0; i < h && first + i < im->n_src; i++) {
         int lineno = first + i + 1;
         int is_cur = (lineno == cur_line);
         if (is_cur)
             wattron(u->wsrc, COLOR_PAIR(CP_CUR) | A_BOLD);
         mvwprintw(u->wsrc, 1 + i, 1, "%c%4d  %-.*s",
                   is_cur ? '>' : ' ', lineno,
-                  w > 7 ? w - 7 : 0, t->src[first + i]);
+                  w > 7 ? w - 7 : 0, im->src[first + i]);
         if (is_cur) {
             /* pad highlight to panel edge */
             int x = getcurx(u->wsrc);
@@ -153,17 +163,17 @@ static void draw_src(ui_t *u)
 
 static void draw_asm(ui_t *u)
 {
-    trace_t *t = u->t;
+    const image_t *im = cur_img(u);
     draw_frame(u->wasm, "disassembly");
     int h = getmaxy(u->wasm) - 2, w = getmaxx(u->wasm) - 2;
     if (h <= 0)
         return;
 
     int cur = cur_step(u)->insn_idx;
-    int first = center_first(cur >= 0 ? cur : 0, (int)t->n_dlines, h);
+    int first = center_first(cur >= 0 ? cur : 0, (int)im->n_dlines, h);
 
-    for (int i = 0; i < h && (size_t)(first + i) < t->n_dlines; i++) {
-        const dline_t *d = &t->dlines[first + i];
+    for (int i = 0; i < h && (size_t)(first + i) < im->n_dlines; i++) {
+        const dline_t *d = &im->dlines[first + i];
         int is_cur = (first + i == cur);
         if (is_cur)
             wattron(u->wasm, COLOR_PAIR(CP_CUR) | A_BOLD);
@@ -249,26 +259,27 @@ static void mem_region(ui_t *u, int pane, uint64_t *base, size_t *len,
                        const uint8_t **buf, const char **name)
 {
     const step_t *s = cur_step(u);
-    const trace_t *t = u->t;
+    const image_t *im = cur_img(u);
     switch (pane) {
     case PANE_STACK:
         *base = s->stack_base; *len = s->stack_len; *buf = s->stack;
         *name = "stack";
         break;
     case PANE_RODATA: /* read-only: loaded once from the ELF, never changes */
-        *base = t->rodata_rng.start;
-        *len  = t->rodata_bytes ? t->rodata_rng.end - t->rodata_rng.start : 0;
-        *buf  = t->rodata_bytes;
+        *base = im->rodata_rng.start;
+        *len  = im->rodata_bytes ? im->rodata_rng.end - im->rodata_rng.start
+                                 : 0;
+        *buf  = im->rodata_bytes;
         *name = "rodata (string literals, constants)";
         break;
     case PANE_CODE:
-        *base = t->text.start;
-        *len  = t->text_bytes ? t->text.end - t->text.start : 0;
-        *buf  = t->text_bytes;
+        *base = im->text.start;
+        *len  = im->text_bytes ? im->text.end - im->text.start : 0;
+        *buf  = im->text_bytes;
         *name = "code (.text machine bytes)";
         break;
     default:
-        *base = t->globals_rng.start; *len = s->globals_len;
+        *base = im->globals_rng.start; *len = s->globals_len;
         *buf = s->globals; *name = "globals (.got/.data/.bss)";
         break;
     }
@@ -414,8 +425,8 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
         uint64_t row_addr = lo + (uint64_t)rowi * 8;
 
         const uint8_t *sbuf =
-            (pane == PANE_CODE)   ? u->t->text_bytes :
-            (pane == PANE_RODATA) ? u->t->rodata_bytes : NULL;
+            (pane == PANE_CODE)   ? cur_img(u)->text_bytes :
+            (pane == PANE_RODATA) ? cur_img(u)->rodata_bytes : NULL;
         draw_hex_row(u, w, 1 + i, row_addr, base, len, sbuf);
 
         /* RSP/RBP markers on the stack, RIP marker on the code bytes */
@@ -442,11 +453,11 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
 
 /* ---------------- output overlay ---------------- */
 
-static size_t output_len_at(const trace_t *t, size_t step)
+static size_t output_len_at(const trace_t *t, uint64_t gseq)
 {
     size_t n = 0;
     for (size_t i = 0; i < t->n_chunks; i++)
-        if (t->chunks[i].step <= step)
+        if (t->chunks[i].gseq <= gseq)
             n = t->chunks[i].off + t->chunks[i].len;
     return n;
 }
@@ -460,7 +471,7 @@ static void draw_out(ui_t *u)
     if (h <= 0)
         return;
 
-    size_t len = output_len_at(u->t, u->cur);
+    size_t len = output_len_at(u->t, cur_step(u)->gseq);
     const char *out = u->t->prog_output;
 
     /* split into lines, keep only the last h */
@@ -515,16 +526,24 @@ static void draw_sys(ui_t *u)
         return;
 
     const trace_t *t = u->t;
-    /* events with step <= cur; show the last h of them */
-    size_t n = 0;
-    while (n < t->n_scs && t->scs[n].step <= u->cur)
-        n++;
-    size_t firstev = n > (size_t)h ? n - (size_t)h : 0;
+    /* this process's events with step <= cur; show the last h of them */
+    size_t match = 0;
+    for (size_t i = 0; i < t->n_scs; i++)
+        if (t->scs[i].proc == u->proc && t->scs[i].step <= u->cur)
+            match++;
+    size_t skip = match > (size_t)h ? match - (size_t)h : 0;
 
-    if (n == 0)
+    if (match == 0)
         mvwprintw(u->wsys, 1, 2, "(no syscalls up to this step)");
-    for (size_t i = firstev; i < n; i++) {
+    int row = 0;
+    for (size_t i = 0; i < t->n_scs; i++) {
         const scevent_t *e = &t->scs[i];
+        if (e->proc != u->proc || e->step > u->cur)
+            continue;
+        if (skip) {
+            skip--;
+            continue;
+        }
         const char *name = cv_syscall_name(e->nr);
         char nbuf[24];
         if (!name) {
@@ -541,9 +560,11 @@ static void draw_sys(ui_t *u)
         int is_cur = (e->step == u->cur);
         if (is_cur)
             wattron(u->wsys, A_BOLD);
-        mvwprintw(u->wsys, 1 + (int)(i - firstev), 1, "%-.*s", w, line);
+        mvwprintw(u->wsys, 1 + row, 1, "%-.*s", w, line);
         if (is_cur)
             wattroff(u->wsys, A_BOLD);
+        if (++row >= h)
+            break;
     }
     wnoutrefresh(u->wsys);
 }
@@ -557,14 +578,20 @@ static void draw_status(ui_t *u)
     clrtoeol();
     attron(A_REVERSE);
 
+    const proc_t *p = cur_proc(u);
     char skipbuf[32] = "";
-    if (t->steps[u->cur].skipped)
+    if (p->steps[u->cur].skipped)
         snprintf(skipbuf, sizeof(skipbuf), " (+%u libc)",
-                 t->steps[u->cur].skipped);
-    char left[256];
+                 p->steps[u->cur].skipped);
+    char procbuf[80] = "";
+    if (t->n_procs > 1)
+        snprintf(procbuf, sizeof(procbuf), " | proc %d/%d pid %d%s",
+                 u->proc + 1, t->n_procs, p->pid,
+                 p->parent >= 0 ? " (child)" : "");
+    char left[320];
     snprintf(left, sizeof(left),
-             " step %zu/%zu%s | mode: %s | mem: %s%s",
-             u->cur, t->n_steps - 1, skipbuf,
+             " step %zu/%zu%s%s | mode: %s | mem: %s%s",
+             u->cur, p->n_steps - 1, skipbuf, procbuf,
              u->mode_src ? "SRC " : "INSN",
              u->mem_pane == PANE_STACK ? "stack" :
              u->mem_pane == PANE_HEAP ? "heap" :
@@ -573,25 +600,24 @@ static void draw_status(ui_t *u)
              t->truncated ? " | TRUNCATED" : "");
     mvprintw(LINES - 1, 0, "%-.*s", COLS, left);
 
-    if (t->fork_step >= 0) {
+    if (p->execed && !p->followed) {
         attron(COLOR_PAIR(CP_BAD) | A_BOLD);
-        printw(" | fork@%lld: children not followed",
-               (long long)t->fork_step);
+        printw(" | exec'd: not followed past exec");
         attroff(COLOR_PAIR(CP_BAD) | A_BOLD);
         attron(A_REVERSE);
     }
-    if (t->death_signal) {
+    if (p->death_signal) {
         attron(COLOR_PAIR(CP_BAD) | A_BOLD);
-        printw(" | killed: signal %d", t->death_signal);
+        printw(" | killed: signal %d", p->death_signal);
         attroff(COLOR_PAIR(CP_BAD) | A_BOLD);
         attron(A_REVERSE);
     } else {
-        printw(" | exit %d", t->exit_code);
+        printw(" | exit %d", p->exit_code);
     }
 
     const char *help =
-        " | </> step  m mode  Tab mem  ^/v scroll  g goto  f fn  o out  "
-        "s sys  q quit";
+        " | </> step  P proc  m mode  Tab mem  ^/v scroll  g goto  f fn  "
+        "o out  s sys  q quit";
     int x = getcurx(stdscr);
     if (x + (int)strlen(help) < COLS)
         printw("%s", help);
@@ -685,38 +711,72 @@ static void redraw(ui_t *u)
 
 /* source-line mode: first index (in direction dir) whose valid src_line
  * differs from the current line (spec 6.3 "스텝 모드 구현") */
-static size_t src_step(trace_t *t, size_t cur, int dir)
+static size_t src_step(const proc_t *p, size_t cur, int dir)
 {
-    int32_t line = t->steps[cur].src_line;
+    int32_t line = p->steps[cur].src_line;
     long i = (long)cur + dir;
-    while (i >= 0 && i < (long)t->n_steps) {
-        int32_t l = t->steps[i].src_line;
+    while (i >= 0 && i < (long)p->n_steps) {
+        int32_t l = p->steps[i].src_line;
         if (l != -1 && l != line)
             return (size_t)i;
         i += dir;
     }
-    return dir > 0 ? t->n_steps - 1 : 0;
+    return dir > 0 ? p->n_steps - 1 : 0;
 }
 
-static size_t insn_step(trace_t *t, size_t cur, int dir)
+static size_t insn_step(const proc_t *p, size_t cur, int dir)
 {
     if (dir > 0)
-        return cur + 1 < t->n_steps ? cur + 1 : cur;
+        return cur + 1 < p->n_steps ? cur + 1 : cur;
     return cur > 0 ? cur - 1 : 0;
 }
 
 /* 'f': jump forward to the next call/ret instruction */
-static size_t fn_boundary(trace_t *t, size_t cur)
+static size_t fn_boundary(const trace_t *t, const proc_t *p, size_t cur)
 {
-    for (size_t i = cur + 1; i < t->n_steps; i++) {
-        int32_t idx = t->steps[i].insn_idx;
+    for (size_t i = cur + 1; i < p->n_steps; i++) {
+        int32_t idx = p->steps[i].insn_idx;
         if (idx < 0)
             continue;
-        const char *x = t->dlines[idx].text;
+        const char *x = t->images[p->steps[i].img]->dlines[idx].text;
         if (strncmp(x, "call", 4) == 0 || strncmp(x, "ret", 3) == 0)
             return i;
     }
-    return t->n_steps - 1;
+    return p->n_steps - 1;
+}
+
+/* 'P': next process with steps, landing on the step whose global sequence
+ * number is closest to the current one (time-synchronized switch) */
+static void switch_proc(ui_t *u)
+{
+    trace_t *t = u->t;
+    if (t->n_procs < 2)
+        return;
+    uint64_t g = cur_step(u)->gseq;
+    int np = u->proc;
+    for (int k = 0; k < t->n_procs; k++) {
+        np = (np + 1) % t->n_procs;
+        if (np != u->proc && t->procs[np].n_steps > 0)
+            break;
+    }
+    proc_t *p = &t->procs[np];
+    if (np == u->proc || p->n_steps == 0)
+        return;
+
+    size_t lo = 0, hi = p->n_steps;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (p->steps[mid].gseq < g)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo >= p->n_steps)
+        lo = p->n_steps - 1;
+    else if (lo > 0 && g - p->steps[lo - 1].gseq < p->steps[lo].gseq - g)
+        lo--;
+    u->proc = np;
+    u->cur = lo;
 }
 
 /* 'g': numeric prompt on the status line */
@@ -746,8 +806,8 @@ static void goto_step(ui_t *u)
     if (n == 0)
         return;
     size_t v = (size_t)strtoull(buf, NULL, 10);
-    if (v >= u->t->n_steps)
-        v = u->t->n_steps - 1;
+    if (v >= cur_proc(u)->n_steps)
+        v = cur_proc(u)->n_steps - 1;
     u->cur = v;
 }
 
@@ -773,6 +833,12 @@ int tui_run(trace_t *t)
     }
 
     ui_t u = { .t = t, .cur = 0, .stack_desc = 1 };
+    for (int pi = 0; pi < t->n_procs; pi++) { /* first proc with steps */
+        if (t->procs[pi].n_steps > 0) {
+            u.proc = pi;
+            break;
+        }
+    }
     make_windows(&u);
     redraw(&u);
 
@@ -780,12 +846,12 @@ int tui_run(trace_t *t)
         int ch = getch();
         switch (ch) {
         case KEY_RIGHT: case 'n':
-            u.cur = u.mode_src ? src_step(t, u.cur, +1)
-                               : insn_step(t, u.cur, +1);
+            u.cur = u.mode_src ? src_step(cur_proc(&u), u.cur, +1)
+                               : insn_step(cur_proc(&u), u.cur, +1);
             break;
         case KEY_LEFT: case 'p':
-            u.cur = u.mode_src ? src_step(t, u.cur, -1)
-                               : insn_step(t, u.cur, -1);
+            u.cur = u.mode_src ? src_step(cur_proc(&u), u.cur, -1)
+                               : insn_step(cur_proc(&u), u.cur, -1);
             break;
         case 'm':
             u.mode_src = !u.mode_src;
@@ -809,7 +875,10 @@ int tui_run(trace_t *t)
             u.cur = 0;
             break;
         case KEY_END:
-            u.cur = t->n_steps - 1;
+            u.cur = cur_proc(&u)->n_steps - 1;
+            break;
+        case 'P':
+            switch_proc(&u);
             break;
         case 'o':
             u.show_out = !u.show_out;
@@ -822,7 +891,7 @@ int tui_run(trace_t *t)
             make_windows(&u);
             break;
         case 'f':
-            u.cur = fn_boundary(t, u.cur);
+            u.cur = fn_boundary(t, cur_proc(&u), u.cur);
             break;
         case KEY_RESIZE:
             make_windows(&u);

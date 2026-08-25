@@ -3,8 +3,8 @@
  * usage: cvisor [options] <target> [target args...]
  *   --dump         static analysis only, print parsed results (Phase 0)
  *   --trace        record, then dump the trace as text (Phase 1)
- *   --from-main    skip recording until RIP reaches main
- *   --max-steps N  recording cap (default 200000)
+ *   --from-main    skip recording until RIP reaches main (per image)
+ *   --max-steps N  recording cap, total across processes (default 200000)
  */
 #define _GNU_SOURCE
 #include "cvisor.h"
@@ -59,16 +59,20 @@ int main(int argc, char **argv)
     trace_t t;
     memset(&t, 0, sizeof(t));
 
-    /* [A] static analysis */
-    if (analyze(&t, target) < 0)
+    /* [A] static analysis of the root image */
+    image_t *im = image_analyze(target, 0);
+    if (!im)
         return 1;
+    t.images[0] = im;
+    t.n_images = 1;
+
     if (opt_dump) {
-        analyze_dump(&t);
+        image_dump(im);
         trace_free(&t);
         return 0;
     }
 
-    /* [B] record */
+    /* [B] record (follows forks; execs re-analyze into further images) */
     if (record(&t, target, target_argv, opt_from_main, max_steps) < 0) {
         trace_free(&t);
         return 1;
@@ -83,14 +87,23 @@ int main(int argc, char **argv)
     int rc = tui_run(&t);
 
     /* post-TUI summary on the normal terminal */
-    printf("cvisor: %zu steps recorded", t.n_steps);
+    printf("cvisor: %llu steps, %d process%s recorded",
+           (unsigned long long)t.gseq_end, t.n_procs,
+           t.n_procs == 1 ? "" : "es");
     if (t.truncated)
         printf(" (truncated at cap)");
-    if (t.death_signal)
-        printf("; target killed by signal %d", t.death_signal);
-    else
-        printf("; target exited with code %d", t.exit_code);
     printf("\n");
+    for (int pi = 0; pi < t.n_procs; pi++) {
+        const proc_t *p = &t.procs[pi];
+        printf("  proc %d (pid %d): ", pi, p->pid);
+        if (p->death_signal)
+            printf("killed by signal %d", p->death_signal);
+        else
+            printf("exit code %d", p->exit_code);
+        if (p->execed)
+            printf(", exec'd%s", p->followed ? "" : " (not followed)");
+        printf("\n");
+    }
 
     trace_free(&t);
     return rc == 0 ? 0 : 1;

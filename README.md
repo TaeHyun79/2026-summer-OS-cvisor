@@ -77,6 +77,7 @@ Running cvisor does: (1) static analysis (objdump/ELF parsing) →
 |---|---|
 | `→` / `n` | next step |
 | `←` / `p` | previous step |
+| `P` | switch process (fork children), time-synchronized via the global order |
 | `m` | toggle step mode (instruction ↔ source line) |
 | `Tab` | cycle memory pane (stack → heap → globals → rodata → code); in the wide layout it moves scroll focus instead |
 | `↑` / `↓` | scroll the memory pane |
@@ -116,15 +117,22 @@ it uses the classic 2×2 layout with a single memory pane cycled by `Tab`.
   the raw `.text` machine bytes with a `<-RIP` marker following execution.
   Every hex pane has an ASCII column. (`.text`/`.rodata` are read-only
   mappings, loaded once from the ELF file.)
-- **fork/clone/execve** are detected and flagged in the status bar; child
-  processes are not followed (Phase 3).
+- **fork is followed**: every child gets its own step stream, and a global
+  sequence number preserves the real interleaving. `P` switches between
+  processes, landing on the step closest in time (so you can compare "where
+  was the other process right now" — e.g. fork returning the pid in the
+  parent and 0 in the child). **exec is followed too**: the new binary is
+  re-analyzed on the fly; if it cannot be analyzed (PIE system binaries,
+  no debug info) that process is marked "not followed past exec" and its
+  trace ends at the exec.
 - **Crashes**: on SIGSEGV etc. the faulting state is the last recorded step;
   press `End`, then walk backwards.
 
 ## Target constraints (Phase 1)
 
 - `-g -O0 -no-pie` required (PIE binaries are rejected by an ELF check)
-- single-threaded, single source file
+- single-threaded (fork/exec are followed; pthreads are not), single source
+  file per binary; up to 8 processes / 8 exec'd binaries per recording
 - addresses are stable across runs because ASLR is disabled for the child —
   a deliberate teaching setup, not how production systems behave
 
@@ -151,8 +159,10 @@ tests/          example/verification programs
 - [x] Phase 0 — static analysis (`--dump`)
 - [x] Phase 1 — record engine (`--trace`), syscall capture, mmap-heap tracking
 - [x] Phase 2 — TUI (MVP)
+- [x] Phase 3a — follow-fork/exec: per-process step streams, global
+      interleaving order, time-synchronized process switching (`P`)
 - [ ] Phase 3 — libdw variable names, libc-skip breakpoint optimization, PIE,
-      diff encoding, follow-fork, threads (visualizing the `threads-intro/t1.c`
+      diff encoding, threads (visualizing the `threads-intro/t1.c`
       race condition instruction-by-instruction is the long-term goal)
 
 ---
@@ -216,6 +226,7 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 |---|---|
 | `→` / `n` | 다음 스텝 |
 | `←` / `p` | 이전 스텝 |
+| `P` | 프로세스 전환 (fork 자식들) — 전역 순서 기준 시간 동기화 점프 |
 | `m` | 스텝 모드 토글 (명령어 ↔ 소스 줄) |
 | `Tab` | 메모리 패널 전환 (stack → heap → globals → rodata → code); 와이드 레이아웃에서는 스크롤 포커스 이동 |
 | `↑` / `↓` | 메모리 패널 스크롤 |
@@ -253,15 +264,21 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
   보임), `rodata`는 문자열 리터럴/상수, `code`는 `.text`의 실제 기계어 바이트를
   `<-RIP` 마커와 함께 보여줍니다. 모든 hex 패널에 ASCII 컬럼이 있습니다.
   (`.text`/`.rodata`는 읽기 전용 매핑이라 ELF 파일에서 1회만 로드)
-- **fork/clone/execve**가 감지되면 상태바에 경고가 뜹니다. 자식 프로세스 추적은
-  Phase 3입니다.
+- **fork를 따라갑니다**: 자식마다 독립된 스텝 스트림이 생기고, 전역 순서번호가
+  실제 인터리빙을 보존합니다. `P`로 프로세스를 전환하면 시간상 가장 가까운
+  스텝으로 이동해 "그 순간 다른 프로세스는 어디였나"를 대조할 수 있습니다
+  (fork가 부모에겐 pid, 자식에겐 0을 반환하는 장면 등). **exec도 따라갑니다**:
+  새 바이너리를 즉석에서 재분석하며, 분석 불가(PIE 시스템 바이너리, 디버그 정보
+  없음)이면 그 프로세스는 "exec 이후 미추적"으로 표시되고 트레이스가 exec에서
+  끝납니다.
 - **크래시**: SIGSEGV 등으로 죽으면 마지막 기록 스텝이 죽기 직전 상태입니다.
   `End`로 간 뒤 `←`로 되감으세요.
 
 ## 대상 프로그램 제약 (Phase 1)
 
 - `-g -O0 -no-pie` 필수 (PIE는 ELF 검사로 거부)
-- 단일 스레드, 단일 소스 파일
+- 단일 스레드 (fork/exec은 추적, pthread는 미지원), 바이너리당 단일 소스 파일;
+  기록당 최대 8개 프로세스 / 8개 exec 바이너리
 - 매 실행 같은 주소가 나오는 것은 자식 프로세스의 ASLR을 꺼서입니다 —
   학습용으로 의도된 설정이며, 실제 시스템 기본값과는 다릅니다
 
@@ -288,6 +305,8 @@ tests/          예제/검증 프로그램
 - [x] Phase 0 — 정적 분석 (`--dump`)
 - [x] Phase 1 — 기록 엔진 (`--trace`), 시스템 콜 캡처, mmap 힙 추적
 - [x] Phase 2 — TUI (MVP)
+- [x] Phase 3a — follow-fork/exec: 프로세스별 스텝 스트림, 전역 인터리빙 순서,
+      시간 동기화 프로세스 전환(`P`)
 - [ ] Phase 3 — libdw 변수 표시, libc 스킵 브레이크포인트 최적화, PIE 지원,
-      디프 인코딩, follow-fork, 멀티스레드 (`threads-intro/t1.c`의 경쟁 조건을
+      디프 인코딩, 멀티스레드 (`threads-intro/t1.c`의 경쟁 조건을
       명령어 단위로 보여주는 것이 장기 목표)

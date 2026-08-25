@@ -13,22 +13,25 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
 #include <sys/user.h> /* struct user_regs_struct */
 
 /* ---------- limits / tunables ---------- */
 
-#define CV_DEFAULT_MAX_STEPS 200000  /* recording cap (spec 6.2.3) */
+#define CV_DEFAULT_MAX_STEPS 200000  /* recording cap, total across procs */
 #define CV_STACK_RED_ZONE    64      /* bytes below RSP to snapshot */
 #define CV_STACK_ABOVE_RSP0  256     /* stack top = initial RSP + this */
 #define CV_STACK_SNAP_MAX    8192    /* per-step stack snapshot cap */
 #define CV_HEAP_SNAP_MAX     65536   /* per-step heap snapshot cap (total) */
-#define CV_GLOBALS_MAX       65536   /* .data + .bss covering range cap */
+#define CV_GLOBALS_MAX       65536   /* .got + .data + .bss covering cap */
 #define CV_HEAP_RECHECK      128     /* re-read /proc/pid/maps every N steps */
 #define CV_MAX_HEAPR         8       /* tracked heap regions: [heap] + mmaps */
 #define CV_STATIC_SEC_MAX    (1u << 20) /* .text/.rodata load cap (bytes) */
 #define CV_MMAP_TRACK_MAX    (16u << 20) /* ignore anon mmaps larger than this */
+#define CV_MAX_PROCS         8       /* followed processes (fork tree) */
+#define CV_MAX_IMAGES        8       /* analyzed binaries (root + execs) */
 
-/* ---------- static analysis ---------- */
+/* ---------- static analysis: one ELF binary = one image ---------- */
 
 typedef struct {
     uint64_t start, end; /* [start, end) */
@@ -53,6 +56,24 @@ typedef struct {
     int32_t  line;
 } lmap_t;
 
+typedef struct {
+    char        path[512];
+    dline_t    *dlines;  size_t n_dlines;
+    insn_ref_t *irefs;   size_t n_irefs;
+    lmap_t     *lmap;    size_t n_lmap;
+    char      **src;     int    n_src;
+    char        src_file[512];
+    range_t     text;
+    range_t     globals_rng;   /* covering range of .got + .data + .bss */
+    range_t     rodata_rng;    /* .rodata, 0/0 if absent */
+    uint8_t    *text_bytes;    /* read-only sections, loaded once from the
+                                * ELF file — identical at runtime (-no-pie,
+                                * mapped r-x / r--) */
+    uint8_t    *rodata_bytes;
+    uint64_t    main_addr;     /* 0 if not found */
+    uint64_t    entry;
+} image_t;
+
 /* ---------- recording ---------- */
 
 /* one snapshotted heap region: the brk [heap] or an anonymous rw mmap */
@@ -66,57 +87,51 @@ typedef struct {
     struct user_regs_struct regs;
     uint8_t  *stack;   size_t stack_len; uint64_t stack_base;
     heapreg_t heapr[CV_MAX_HEAPR]; int n_heapr;
-    uint8_t  *globals; size_t globals_len; /* base is trace-wide */
+    uint8_t  *globals; size_t globals_len; /* base: image globals_rng */
+    uint64_t  gseq;      /* global order across all processes */
+    int32_t   img;       /* index into trace images (changes on exec) */
     int32_t   src_line;  /* 1-based, -1 = no mapping */
-    int32_t   insn_idx;  /* index into dlines, -1 = unknown */
+    int32_t   insn_idx;  /* index into image dlines, -1 = unknown */
     uint32_t  skipped;   /* unrecorded (libc) instructions executed since
-                          * the previous recorded step */
+                          * the previous recorded step of this process */
 } step_t;
+
+/* one followed process (fork tree member) */
+typedef struct {
+    pid_t    pid;
+    int      parent;        /* proc index, -1 = the root process */
+    step_t  *steps;  size_t n_steps, cap_steps;
+    int      exit_code;     /* valid when death_signal == 0 */
+    int      death_signal;  /* 0 = normal exit */
+    int      execed;        /* an execve was seen */
+    int      followed;      /* 0 = exec'd into a binary we cannot analyze
+                             * (e.g. PIE): trace ends at the exec */
+} proc_t;
 
 /* a syscall observed while stepping (recorded steps only) */
 typedef struct {
-    size_t   step;    /* last recorded step index before the syscall */
+    int      proc;    /* proc index */
+    size_t   step;    /* last recorded step of that proc before the call */
     int64_t  nr;
     uint64_t args[6]; /* rdi rsi rdx r10 r8 r9 at the syscall insn */
     int64_t  ret;
 } scevent_t;
 
-/* a chunk of target stdout/stderr, attributed to the step it appeared at */
+/* a chunk of target stdout/stderr (all procs share the inherited pipe) */
 typedef struct {
-    size_t step;
-    size_t off, len; /* into trace_t.prog_output */
+    uint64_t gseq;
+    size_t   off, len; /* into trace_t.prog_output */
 } outchunk_t;
 
 typedef struct {
-    /* [A] static analysis */
-    dline_t    *dlines;  size_t n_dlines;
-    insn_ref_t *irefs;   size_t n_irefs;
-    lmap_t     *lmap;    size_t n_lmap;
-    char      **src;     int    n_src;
-    char        src_file[512];
-    range_t     text;
-    range_t     globals_rng;   /* covering range of .got + .data + .bss */
-    range_t     rodata_rng;    /* .rodata, 0/0 if absent */
-    uint8_t    *text_bytes;    /* read-only sections, loaded once from the
-                                * ELF file — identical at runtime (-no-pie,
-                                * mapped r-x / r--), so no per-step snapshot */
-    uint8_t    *rodata_bytes;
-    uint64_t    main_addr;     /* 0 if not found */
-    uint64_t    entry;
-
-    /* [B] recording */
-    step_t     *steps;   size_t n_steps, cap_steps;
+    image_t    *images[CV_MAX_IMAGES]; int n_images;
+    proc_t      procs[CV_MAX_PROCS];   int n_procs;
     int         truncated;
-    int         exit_code;     /* valid when death_signal == 0 */
-    int         death_signal;  /* 0 = normal exit */
+    uint64_t    gseq_end;    /* total recorded steps across procs */
     char       *prog_output; size_t out_len, out_cap;
     outchunk_t *chunks;      size_t n_chunks, cap_chunks;
     scevent_t  *scs;         size_t n_scs, cap_scs;
-    int64_t     fork_step;     /* first step where fork/clone/exec was seen,
-                                * -1 = never (children are NOT followed) */
 } trace_t;
-
-const char *cv_syscall_name(int64_t nr); /* trace.c; NULL if unknown */
 
 /* ---------- register table (recorder dump + TUI share this) ---------- */
 
@@ -128,12 +143,14 @@ typedef struct {
 extern const regdesc_t CV_REGS[];
 extern const int       CV_NREGS;
 
-uint64_t cv_reg(const struct user_regs_struct *r, int i);
+uint64_t    cv_reg(const struct user_regs_struct *r, int i);
+const char *cv_syscall_name(int64_t nr); /* NULL if unknown */
 
 /* ---------- analyzer.c ---------- */
 
-int  analyze(trace_t *t, const char *target_path);
-void analyze_dump(const trace_t *t);
+image_t *image_analyze(const char *target_path, int quiet);
+void     image_dump(const image_t *img);
+void     image_free(image_t *img);
 
 /* ---------- recorder.c ---------- */
 
@@ -143,9 +160,9 @@ void record_dump(const trace_t *t);
 
 /* ---------- trace.c ---------- */
 
-int32_t trace_insn_lookup(const trace_t *t, uint64_t rip); /* -> dlines idx */
-int32_t trace_line_lookup(const trace_t *t, uint64_t rip); /* -> src line  */
-step_t *trace_new_step(trace_t *t);                        /* NULL if full */
+int32_t img_insn_lookup(const image_t *img, uint64_t rip);
+int32_t img_line_lookup(const image_t *img, uint64_t rip);
+step_t *proc_new_step(proc_t *p);            /* NULL on OOM */
 void    trace_append_output(trace_t *t, const char *buf, size_t len);
 void    trace_free(trace_t *t);
 
