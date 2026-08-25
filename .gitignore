@@ -3,6 +3,8 @@ cvisor
 src/*.o
 tests/*
 !tests/*.c
+ch6/*
+!ch6/*.c
 
 # CMake / CLion
 cmake-build-*/
