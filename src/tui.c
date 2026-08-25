@@ -29,6 +29,7 @@ enum {
     CP_MARK,      /* RSP/RBP markers */
     CP_TITLE,     /* panel titles */
     CP_BAD,       /* death signal in status bar */
+    CP_VAR,       /* variable names/values (libdw) */
 };
 
 typedef struct {
@@ -41,10 +42,22 @@ typedef struct {
     int      stack_desc;            /* 1 = high addresses on top (CSAPP) */
     int      show_out;
     int      show_sys;              /* syscall log overlay */
+    int      show_vars;             /* variables overlay (libdw) */
     int      wide;                  /* 4x2 layout: all memory panes shown */
-    WINDOW  *wsrc, *wasm, *wreg, *wmem, *wout, *wsys;
+    WINDOW  *wsrc, *wasm, *wreg, *wmem, *wout, *wsys, *wvar;
     WINDOW  *wmems[PANE_N];         /* wide mode: one window per section */
 } ui_t;
+
+/* one resolvable variable of the current step: local/param of the function
+ * at RIP, or an image global — with its value snapshot-decoded */
+typedef struct {
+    const dvar_t *v;
+    uint64_t      addr;
+    char          val[48];
+    int           has_val;
+    int           changed;
+} varview_t;
+#define MAX_VARVIEW 64
 
 /* ---------------- helpers ---------------- */
 
@@ -85,6 +98,130 @@ static int step_byte(const trace_t *t, const step_t *s, uint64_t addr,
         return 0;
     }
     return -1;
+}
+
+/* ---------------- variable views (libdw) ---------------- */
+
+/* little-endian read of 1..8 bytes from a step's snapshots */
+static int step_read(const trace_t *t, const step_t *s, uint64_t addr,
+                     uint32_t size, uint64_t *out)
+{
+    if (size == 0 || size > 8)
+        return -1;
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        uint8_t b;
+        if (step_byte(t, s, addr + i, &b) < 0)
+            return -1;
+        v |= (uint64_t)b << (8 * i);
+    }
+    *out = v;
+    return 0;
+}
+
+/* DW_ATE_* values (hardcoded so tui.c needs no dwarf.h) */
+#define ATE_BOOL   2
+#define ATE_FLOAT  4
+#define ATE_SIGNED 5
+#define ATE_SCHAR  6
+#define ATE_UNSIG  7
+#define ATE_UCHAR  8
+
+static void fmt_val(const dvar_t *v, uint64_t raw, char *buf, size_t n)
+{
+    if (v->is_ptr) {
+        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
+        return;
+    }
+    switch (v->enc) {
+    case ATE_FLOAT:
+        if (v->size == 4) {
+            float f;
+            uint32_t r32 = (uint32_t)raw;
+            memcpy(&f, &r32, 4);
+            snprintf(buf, n, "%g", (double)f);
+        } else {
+            double d;
+            memcpy(&d, &raw, 8);
+            snprintf(buf, n, "%g", d);
+        }
+        return;
+    case ATE_SIGNED: case ATE_SCHAR: {
+        int64_t sv = (int64_t)raw;
+        if (v->size < 8) { /* sign-extend */
+            uint64_t m = 1ull << (8 * v->size - 1);
+            sv = (int64_t)((raw ^ m) - m);
+        }
+        if (v->enc == ATE_SCHAR && sv >= 0x20 && sv < 0x7f)
+            snprintf(buf, n, "'%c' (%lld)", (char)sv, (long long)sv);
+        else if (sv >= 4096 || sv <= -4096)
+            snprintf(buf, n, "%lld (0x%llx)", (long long)sv,
+                     (unsigned long long)raw);
+        else
+            snprintf(buf, n, "%lld", (long long)sv);
+        return;
+    }
+    case ATE_BOOL:
+        snprintf(buf, n, "%s", raw ? "true" : "false");
+        return;
+    case ATE_UCHAR:
+        if (raw >= 0x20 && raw < 0x7f) {
+            snprintf(buf, n, "'%c' (%llu)", (char)raw,
+                     (unsigned long long)raw);
+            return;
+        }
+        /* fall through */
+    case ATE_UNSIG:
+        if (raw >= 4096)
+            snprintf(buf, n, "%llu (0x%llx)", (unsigned long long)raw,
+                     (unsigned long long)raw);
+        else
+            snprintf(buf, n, "%llu", (unsigned long long)raw);
+        return;
+    default:
+        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
+        return;
+    }
+}
+
+static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
+                         varview_t *vv)
+{
+    const trace_t *t = u->t;
+    const step_t *s = cur_step(u), *p = prev_step(u);
+    vv->v = v;
+    vv->addr = dvar_addr(f, v, s->regs.rbp);
+    vv->has_val = 0;
+    vv->changed = 0;
+    uint64_t raw, praw;
+    if (step_read(t, s, vv->addr, v->size, &raw) == 0) {
+        vv->has_val = 1;
+        fmt_val(v, raw, vv->val, sizeof(vv->val));
+        uint64_t paddr = v->is_global ? v->addr
+                                      : dvar_addr(f, v, p->regs.rbp);
+        vv->changed = (u->cur > 0 &&
+                       (step_read(t, p, paddr, v->size, &praw) < 0 ||
+                        praw != raw));
+    } else {
+        snprintf(vv->val, sizeof(vv->val), "?");
+    }
+}
+
+/* locals/params of the function at RIP first, then image globals */
+static int build_varviews(ui_t *u, varview_t *out, int max,
+                          const dfunc_t **fout)
+{
+    const image_t *im = cur_img(u);
+    const dfunc_t *f = img_func_at(im, cur_step(u)->regs.rip);
+    int n = 0;
+    if (f)
+        for (int i = 0; i < f->n_vars && n < max; i++)
+            fill_varview(u, f, &f->vars[i], &out[n++]);
+    for (int i = 0; i < im->n_gvars && n < max; i++)
+        fill_varview(u, f, &im->gvars[i], &out[n++]);
+    if (fout)
+        *fout = f;
+    return n;
 }
 
 static void draw_frame_f(WINDOW *w, const char *title, int focus)
@@ -403,6 +540,12 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
     uint64_t hi = (base + len + 7) & ~(uint64_t)7;
     int nrows = (int)((hi - lo) / 8);
 
+    /* variable annotations for stack/globals rows (libdw) */
+    varview_t vvs[MAX_VARVIEW];
+    int n_vv = 0;
+    if (pane == PANE_STACK || pane == PANE_GLOBALS)
+        n_vv = build_varviews(u, vvs, MAX_VARVIEW, NULL);
+
     /* centering anchor: RSP row for the stack, RIP row for code */
     int anchor = 0;
     if (pane == PANE_STACK && s->regs.rsp >= lo && s->regs.rsp < hi)
@@ -446,6 +589,25 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
             wattron(w, COLOR_PAIR(CP_MARK) | A_BOLD);
             wprintw(w, " <-RIP");
             wattroff(w, COLOR_PAIR(CP_MARK) | A_BOLD);
+        }
+
+        /* inline variable annotations: names whose address is in this row */
+        for (int k = 0; k < n_vv; k++) {
+            const varview_t *vv = &vvs[k];
+            if (vv->addr < row_addr || vv->addr >= row_addr + 8)
+                continue;
+            if (pane == PANE_GLOBALS && !vv->v->is_global)
+                continue;
+            if (pane == PANE_STACK && vv->v->is_global)
+                continue;
+            wattron(w, COLOR_PAIR(CP_VAR) | A_BOLD);
+            wprintw(w, " %s=", vv->v->name);
+            wattroff(w, COLOR_PAIR(CP_VAR) | A_BOLD);
+            int vattr = vv->changed ? (COLOR_PAIR(CP_CHG) | A_BOLD)
+                                    : COLOR_PAIR(CP_VAR);
+            wattron(w, vattr);
+            wprintw(w, "%s", vv->val);
+            wattroff(w, vattr);
         }
     }
     wnoutrefresh(w);
@@ -569,6 +731,90 @@ static void draw_sys(ui_t *u)
     wnoutrefresh(u->wsys);
 }
 
+/* ---------------- variables overlay ---------------- */
+
+static void draw_vars(ui_t *u)
+{
+    if (!u->wvar)
+        return;
+    draw_frame(u->wvar, "variables (v: close)");
+    int h = getmaxy(u->wvar) - 2, w = getmaxx(u->wvar) - 2;
+    if (h <= 0)
+        return;
+
+    varview_t vvs[MAX_VARVIEW];
+    const dfunc_t *f = NULL;
+    int n = build_varviews(u, vvs, MAX_VARVIEW, &f);
+
+    int row = 0;
+    if (f) {
+        wattron(u->wvar, A_BOLD);
+        mvwprintw(u->wvar, 1 + row++, 1, "fn %s  [0x%llx-0x%llx]",
+                  f->name, (unsigned long long)f->lo,
+                  (unsigned long long)f->hi);
+        wattroff(u->wvar, A_BOLD);
+    } else {
+        mvwprintw(u->wvar, 1 + row++, 1,
+                  "(no function info at this address)");
+    }
+
+    int shown_globals_hdr = 0;
+    for (int i = 0; i < n && row < h; i++) {
+        const varview_t *vv = &vvs[i];
+        const dvar_t *v = vv->v;
+        if (v->is_global && !shown_globals_hdr) {
+            if (row < h) {
+                wattron(u->wvar, A_BOLD);
+                mvwprintw(u->wvar, 1 + row++, 1, "globals:");
+                wattroff(u->wvar, A_BOLD);
+            }
+            shown_globals_hdr = 1;
+        }
+        if (row >= h)
+            break;
+
+        char loc[40];
+        if (v->is_global) {
+            snprintf(loc, sizeof(loc), "0x%llx",
+                     (unsigned long long)v->addr);
+        } else {
+            /* static offset from RBP (CFA = RBP+16), stable even while
+             * the prologue has not set RBP up yet */
+            long long rbp_off = f ? (f->fb_cfa ? v->off + 16
+                                               : f->fb_off + v->off)
+                                  : v->off;
+            if (vv->has_val)
+                snprintf(loc, sizeof(loc), "rbp%+lld  (0x%llx)", rbp_off,
+                         (unsigned long long)vv->addr);
+            else
+                snprintf(loc, sizeof(loc), "rbp%+lld", rbp_off);
+        }
+
+        int y = 1 + row++;
+        wattron(u->wvar, COLOR_PAIR(CP_VAR) | A_BOLD);
+        mvwprintw(u->wvar, y, 1, "  %-14.14s", v->name);
+        wattroff(u->wvar, COLOR_PAIR(CP_VAR) | A_BOLD);
+        wattron(u->wvar, A_DIM);
+        wprintw(u->wvar, " : %-12.12s%s", v->type,
+                v->is_param ? " param " : "       ");
+        wattroff(u->wvar, A_DIM);
+        wprintw(u->wvar, "= ");
+        int vattr = vv->changed ? (COLOR_PAIR(CP_CHG) | A_BOLD)
+                                : COLOR_PAIR(CP_VAR);
+        wattron(u->wvar, vattr);
+        wprintw(u->wvar, "%-22.22s",
+                vv->has_val ? vv->val : (v->size ? "?" : "<agg>"));
+        wattroff(u->wvar, vattr);
+        wattron(u->wvar, A_DIM);
+        wprintw(u->wvar, " @ %-.*s", w - getcurx(u->wvar) - 1, loc);
+        wattroff(u->wvar, A_DIM);
+    }
+    if (n == 0 && row < h)
+        mvwprintw(u->wvar, 1 + row, 1,
+                  "(no variables — was the target built with -g?)");
+    wnoutrefresh(u->wvar);
+}
+
 /* ---------------- status bar ---------------- */
 
 static void draw_status(ui_t *u)
@@ -616,7 +862,7 @@ static void draw_status(ui_t *u)
     }
 
     const char *help =
-        " | </> step  P proc  m mode  Tab mem  ^/v scroll  g goto  f fn  "
+        " | </> step  P proc  m mode  Tab mem  g goto  f fn  v vars  "
         "o out  s sys  q quit";
     int x = getcurx(stdscr);
     if (x + (int)strlen(help) < COLS)
@@ -638,7 +884,9 @@ static void destroy_windows(ui_t *u)
     if (u->wmem) delwin(u->wmem);
     if (u->wout) delwin(u->wout);
     if (u->wsys) delwin(u->wsys);
+    if (u->wvar) delwin(u->wvar);
     u->wsrc = u->wasm = u->wreg = u->wmem = u->wout = u->wsys = NULL;
+    u->wvar = NULL;
     for (int i = 0; i < PANE_N; i++) {
         if (u->wmems[i])
             delwin(u->wmems[i]);
@@ -684,6 +932,10 @@ static void make_windows(ui_t *u)
         int oh = usable / 2;
         u->wsys = newwin(oh, COLS, usable - oh, 0);
     }
+    if (u->show_vars) {
+        int oh = usable / 2;
+        u->wvar = newwin(oh, COLS, usable - oh, 0);
+    }
 }
 
 static void redraw(ui_t *u)
@@ -703,6 +955,8 @@ static void redraw(ui_t *u)
         draw_out(u);
     if (u->show_sys)
         draw_sys(u);
+    if (u->show_vars)
+        draw_vars(u);
     draw_status(u);
     doupdate();
 }
@@ -830,6 +1084,7 @@ int tui_run(trace_t *t)
         init_pair(CP_MARK,  COLOR_YELLOW, -1);
         init_pair(CP_TITLE, COLOR_CYAN,  -1);
         init_pair(CP_BAD,   COLOR_RED,   -1);
+        init_pair(CP_VAR,   COLOR_GREEN, -1);
     }
 
     ui_t u = { .t = t, .cur = 0, .stack_desc = 1 };
@@ -883,11 +1138,19 @@ int tui_run(trace_t *t)
         case 'o':
             u.show_out = !u.show_out;
             u.show_sys = 0;
+            u.show_vars = 0;
             make_windows(&u);
             break;
         case 's':
             u.show_sys = !u.show_sys;
             u.show_out = 0;
+            u.show_vars = 0;
+            make_windows(&u);
+            break;
+        case 'v':
+            u.show_vars = !u.show_vars;
+            u.show_out = 0;
+            u.show_sys = 0;
             make_windows(&u);
             break;
         case 'f':

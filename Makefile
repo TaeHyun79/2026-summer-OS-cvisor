@@ -1,9 +1,10 @@
 # cvisor - Linux x86-64 only (see README.md §2)
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -g -O2
-LDLIBS   = -lncurses
+LDLIBS   = -lncurses -ldw
 
-SRCS := src/main.c src/analyzer.c src/recorder.c src/trace.c src/tui.c
+SRCS := src/main.c src/analyzer.c src/recorder.c src/trace.c src/tui.c \
+        src/dwarfvars.c
 OBJS := $(SRCS:.c=.o)
 
 # test targets: OSTEP-compatible build flags are mandatory (spec §4)

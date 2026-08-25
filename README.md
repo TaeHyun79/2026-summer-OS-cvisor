@@ -31,7 +31,8 @@ SIGSEGV, you land in the TUI at the recording of its final moments.
 ## Requirements
 
 - **Linux x86-64 only** (enforced at compile time). glibc recommended.
-- `gcc`, `make`, `binutils` (objdump is used at runtime), `libncurses-dev`.
+- `gcc`, `make`, `binutils` (objdump is used at runtime), `libncurses-dev`,
+  `libdw-dev` (elfutils — variable names/types from DWARF).
 
 ### On an Apple Silicon Mac
 
@@ -46,7 +47,7 @@ A native x86-64 Linux server over ssh works best if you have one.
 ## Build
 
 ```sh
-make            # build cvisor (needs libncurses-dev)
+make            # build cvisor (needs libncurses-dev, libdw-dev)
 make tests      # build the example programs in tests/
 make check      # quick smoke test
 ```
@@ -86,6 +87,7 @@ Running cvisor does: (1) static analysis (objdump/ELF parsing) →
 | `Home` / `End` | first / last step |
 | `o` | program-output panel (shows output produced *up to this step*) |
 | `s` | syscall log panel (number, args, return value, up to this step) |
+| `v` | variables panel: locals/params of the current function + globals, with typed values |
 | `f` | advance to the next call/ret instruction |
 | `q` | quit |
 
@@ -149,6 +151,7 @@ src/cvisor.h    shared types (trace_t, step_t, ...) and tunables
 src/analyzer.c  static analysis: ELF headers + objdump -d / decodedline parsing
 src/recorder.c  ptrace engine: fork+TRACEME+ASLR off, SINGLESTEP loop, snapshots
 src/trace.c     trace storage, binary-search lookups, register/syscall tables
+src/dwarfvars.c variable names/types/locations from DWARF (libdw)
 src/tui.c       ncurses panels, overlays, status bar
 src/main.c      option parsing and orchestration
 tests/          example/verification programs
@@ -161,7 +164,9 @@ tests/          example/verification programs
 - [x] Phase 2 — TUI (MVP)
 - [x] Phase 3a — follow-fork/exec: per-process step streams, global
       interleaving order, time-synchronized process switching (`P`)
-- [ ] Phase 3 — libdw variable names, libc-skip breakpoint optimization, PIE,
+- [x] Phase 3b — libdw variable display: green name/value annotations on the
+      stack/globals hex rows plus the `v` variables panel (red on change)
+- [ ] Phase 3 — libc-skip breakpoint optimization, PIE,
       diff encoding, threads (visualizing the `threads-intro/t1.c`
       race condition instruction-by-instruction is the long-term goal)
 
@@ -183,7 +188,8 @@ TUI에 진입해 `End` → `←`로 원인을 거슬러 올라갈 수 있습니�
 ## 요구 사항
 
 - **Linux x86-64 전용** (다른 플랫폼은 컴파일 단계에서 거부). glibc 권장.
-- `gcc`, `make`, `binutils`(런타임에 objdump 사용), `libncurses-dev`.
+- `gcc`, `make`, `binutils`(런타임에 objdump 사용), `libncurses-dev`,
+  `libdw-dev`(elfutils — DWARF에서 변수 이름/타입 추출).
 
 ### Apple Silicon 맥에서
 
@@ -197,7 +203,7 @@ x86-64 리눅스 VM([Lima](https://lima-vm.io)나 UTM의 QEMU 전체 에뮬레�
 ## 빌드
 
 ```sh
-make            # cvisor 빌드 (libncurses-dev 필요)
+make            # cvisor 빌드 (libncurses-dev, libdw-dev 필요)
 make tests      # tests/ 예제 프로그램 빌드
 make check      # 스모크 테스트
 ```
@@ -235,6 +241,7 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 | `Home` / `End` | 처음 / 마지막 스텝 |
 | `o` | 프로그램 출력 패널 (현재 스텝까지의 출력만 표시) |
 | `s` | 시스템 콜 로그 패널 (번호/인자/반환값, 현재 스텝까지) |
+| `v` | 변수 패널: 현재 함수의 지역변수/인자 + 전역, 타입 해석된 값과 함께 |
 | `f` | 다음 call/ret 명령어까지 전진 |
 | `q` | 종료 |
 
@@ -295,6 +302,7 @@ src/cvisor.h    공용 타입 (trace_t, step_t, ...) 및 튜너블
 src/analyzer.c  정적 분석: ELF 헤더 + objdump -d / decodedline 파싱
 src/recorder.c  ptrace 엔진: fork+TRACEME+ASLR off, SINGLESTEP 루프, 스냅샷
 src/trace.c     트레이스 저장, 이진탐색 조회, 레지스터/시스템콜 테이블
+src/dwarfvars.c DWARF에서 변수 이름/타입/위치 추출 (libdw)
 src/tui.c       ncurses 패널·오버레이·상태바
 src/main.c      옵션 파싱 및 오케스트레이션
 tests/          예제/검증 프로그램
@@ -307,6 +315,8 @@ tests/          예제/검증 프로그램
 - [x] Phase 2 — TUI (MVP)
 - [x] Phase 3a — follow-fork/exec: 프로세스별 스텝 스트림, 전역 인터리빙 순서,
       시간 동기화 프로세스 전환(`P`)
-- [ ] Phase 3 — libdw 변수 표시, libc 스킵 브레이크포인트 최적화, PIE 지원,
+- [x] Phase 3b — libdw 변수 표시: 스택/globals hex 행의 초록 이름=값 주석 +
+      `v` 변수 패널 (값 변경 시 빨강 강조)
+- [ ] Phase 3 — libc 스킵 브레이크포인트 최적화, PIE 지원,
       디프 인코딩, 멀티스레드 (`threads-intro/t1.c`의 경쟁 조건을
       명령어 단위로 보여주는 것이 장기 목표)

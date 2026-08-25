@@ -56,6 +56,34 @@ typedef struct {
     int32_t  line;
 } lmap_t;
 
+/* ---------- DWARF variable info (libdw, spec 6.4) ---------- */
+
+/* one variable: a local/param (frame-relative) or a global (absolute).
+ * At -O0 every location is either DW_OP_fbreg <off> or DW_OP_addr. */
+typedef struct {
+    char     name[64];
+    char     type[64];
+    int      is_param;
+    int      is_global;  /* 1: `addr` valid; 0: `off` is frame-relative */
+    int64_t  off;        /* offset from the frame base */
+    uint64_t addr;
+    uint32_t size;       /* byte size, 0 = unknown/aggregate */
+    int      enc;        /* DW_ATE_* encoding, 0 = unknown */
+    int      is_ptr;
+} dvar_t;
+
+/* one function's scope: [lo, hi) plus how to compute its frame base.
+ * gcc -O0 emits DW_AT_frame_base = DW_OP_call_frame_cfa, which with a
+ * frame pointer equals RBP + 16 inside the body; older styles use
+ * DW_OP_breg6 (RBP-relative) directly. */
+typedef struct {
+    uint64_t lo, hi;
+    char     name[64];
+    int      fb_cfa;     /* 1: frame base = RBP + 16 (CFA) */
+    int64_t  fb_off;     /* when !fb_cfa: frame base = RBP + fb_off */
+    dvar_t  *vars; int n_vars;
+} dfunc_t;
+
 typedef struct {
     char        path[512];
     dline_t    *dlines;  size_t n_dlines;
@@ -72,6 +100,8 @@ typedef struct {
     uint8_t    *rodata_bytes;
     uint64_t    main_addr;     /* 0 if not found */
     uint64_t    entry;
+    dfunc_t    *funcs; int n_funcs; /* sorted by lo; empty if no libdw info */
+    dvar_t     *gvars; int n_gvars; /* global variables (DW_OP_addr) */
 } image_t;
 
 /* ---------- recording ---------- */
@@ -151,6 +181,13 @@ const char *cv_syscall_name(int64_t nr); /* NULL if unknown */
 image_t *image_analyze(const char *target_path, int quiet);
 void     image_dump(const image_t *img);
 void     image_free(image_t *img);
+
+/* ---------- dwarfvars.c (libdw) ---------- */
+
+int            dw_load_vars(image_t *img, const char *path); /* soft-fail */
+const dfunc_t *img_func_at(const image_t *img, uint64_t rip);
+/* frame-relative var -> absolute address given the function's frame base */
+uint64_t       dvar_addr(const dfunc_t *f, const dvar_t *v, uint64_t rbp);
 
 /* ---------- recorder.c ---------- */
 

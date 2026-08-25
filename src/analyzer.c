@@ -516,6 +516,7 @@ image_t *image_analyze(const char *target_path, int quiet)
         return NULL;
     }
     load_source(im, target_path); /* soft failure: TUI degrades gracefully */
+    dw_load_vars(im, target_path); /* soft failure: no variable names */
     g_quiet = 0;
     return im;
 }
@@ -534,6 +535,10 @@ void image_free(image_t *im)
     free(im->src);
     free(im->text_bytes);
     free(im->rodata_bytes);
+    for (int i = 0; i < im->n_funcs; i++)
+        free(im->funcs[i].vars);
+    free(im->funcs);
+    free(im->gvars);
     free(im);
 }
 
@@ -567,4 +572,25 @@ void image_dump(const image_t *im)
                (unsigned long long)im->lmap[i].addr, im->lmap[i].line);
 
     printf("\n== source: %d lines ==\n", im->n_src);
+
+    printf("\n== DWARF variables: %d functions, %d globals ==\n",
+           im->n_funcs, im->n_gvars);
+    for (int i = 0; i < im->n_funcs; i++) {
+        const dfunc_t *f = &im->funcs[i];
+        printf("fn %s [0x%llx-0x%llx] frame_base=%s%+lld\n", f->name,
+               (unsigned long long)f->lo, (unsigned long long)f->hi,
+               f->fb_cfa ? "cfa" : "rbp",
+               (long long)(f->fb_cfa ? 0 : f->fb_off));
+        for (int v = 0; v < f->n_vars; v++) {
+            const dvar_t *dv = &f->vars[v];
+            printf("  %-12s : %-10s %s fb%+lld (size %u)\n", dv->name,
+                   dv->type, dv->is_param ? "param" : "local",
+                   (long long)dv->off, dv->size);
+        }
+    }
+    for (int v = 0; v < im->n_gvars; v++) {
+        const dvar_t *dv = &im->gvars[v];
+        printf("global %-12s : %-10s @ 0x%llx (size %u)\n", dv->name,
+               dv->type, (unsigned long long)dv->addr, dv->size);
+    }
 }
