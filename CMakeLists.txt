@@ -21,3 +21,7 @@ find_library(NCURSES_LIB ncurses)
 if(NCURSES_LIB)
     target_link_libraries(cvisor ${NCURSES_LIB})
 endif()
+
+# separate target so CLion indexes the example program (it has its own
+# main(), so it must NOT be compiled into the cvisor binary above)
+add_executable(ch4_test ch4/test.c)
