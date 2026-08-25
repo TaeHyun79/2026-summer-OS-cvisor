@@ -6,6 +6,7 @@ tests/*
 !tests/*.s
 ch6/*
 !ch6/*.c
+!ch6/*.s
 
 # CMake / CLion
 cmake-build-*/

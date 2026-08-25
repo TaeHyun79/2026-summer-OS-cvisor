@@ -26,6 +26,11 @@ CH6SRCS := $(wildcard ch6/*.c)
 CH6BINS := $(CH6SRCS:.c=)
 CH6CV   := $(CH6SRCS:.c=_cv)
 
+# ch6 assembly (swtch.s): already -O0 by construction, so there is no
+# separate _cv build — the one binary is both runnable and traceable
+CH6ASMSRCS := $(wildcard ch6/*.s)
+CH6ASMBINS := $(CH6ASMSRCS:.s=)
+
 all: cvisor
 
 cvisor: $(OBJS)
@@ -46,13 +51,18 @@ tests/%: tests/%.s
 	$(LD) -o $@ $@.o
 	rm -f $@.o
 
-ch6: $(CH6BINS) $(CH6CV)
+ch6: $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
 
 ch6/%_cv: ch6/%.c
 	$(CC) $(TESTCFLAGS) -Wall -Wextra -o $@ $<
 
 ch6/%: ch6/%.c
 	$(CC) -O2 -Wall -Wextra -o $@ $<
+
+ch6/%: ch6/%.s
+	$(AS) $(ASFLAGS) -o $@.o $<
+	$(LD) -o $@ $@.o
+	rm -f $@.o
 
 check: cvisor tests
 	./cvisor --dump tests/factorial > /dev/null && echo "dump: OK"
@@ -61,7 +71,8 @@ check: cvisor tests
 	./cvisor --trace --from-main tests/crash | tail -3
 
 clean:
-	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) $(CH6BINS) $(CH6CV)
-	rm -f $(addsuffix .o,$(TESTASMBINS))
+	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) \
+	      $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
+	rm -f $(addsuffix .o,$(TESTASMBINS) $(CH6ASMBINS))
 
 .PHONY: all tests ch6 check clean
