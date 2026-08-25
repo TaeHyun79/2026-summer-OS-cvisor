@@ -73,18 +73,32 @@ static int elf_analyze(trace_t *t, const char *path)
     const Elf64_Shdr *sh = (const Elf64_Shdr *)((const char *)map + eh->e_shoff);
     const char *shstr = (const char *)map + sh[eh->e_shstrndx].sh_offset;
 
-    range_t data = {0, 0}, bss = {0, 0};
+    /* runtime-mutable writable sections merged into the globals range:
+     * .got/.got.plt sit right before .data, and watching a GOT entry flip
+     * on the first printf call is lazy binding made visible */
+    static const char *const WR_SECS[] = { ".got", ".got.plt", ".data",
+                                           ".bss" };
+    range_t wr = {0, 0};
+    uint64_t text_off = 0, ro_off = 0;
     for (int i = 0; i < eh->e_shnum; i++) {
         const char *name = shstr + sh[i].sh_name;
         if (strcmp(name, ".text") == 0) {
             t->text.start = sh[i].sh_addr;
             t->text.end   = sh[i].sh_addr + sh[i].sh_size;
-        } else if (strcmp(name, ".data") == 0) {
-            data.start = sh[i].sh_addr;
-            data.end   = sh[i].sh_addr + sh[i].sh_size;
-        } else if (strcmp(name, ".bss") == 0) {
-            bss.start = sh[i].sh_addr;
-            bss.end   = sh[i].sh_addr + sh[i].sh_size;
+            text_off      = sh[i].sh_offset;
+        } else if (strcmp(name, ".rodata") == 0) {
+            t->rodata_rng.start = sh[i].sh_addr;
+            t->rodata_rng.end   = sh[i].sh_addr + sh[i].sh_size;
+            ro_off              = sh[i].sh_offset;
+        } else {
+            for (size_t k = 0; k < sizeof(WR_SECS) / sizeof(WR_SECS[0]); k++) {
+                if (strcmp(name, WR_SECS[k]) != 0)
+                    continue;
+                if (wr.start == 0 || sh[i].sh_addr < wr.start)
+                    wr.start = sh[i].sh_addr;
+                if (sh[i].sh_addr + sh[i].sh_size > wr.end)
+                    wr.end = sh[i].sh_addr + sh[i].sh_size;
+            }
         }
     }
     if (t->text.start == 0) {
@@ -92,17 +106,30 @@ static int elf_analyze(trace_t *t, const char *path)
         goto out;
     }
 
-    /* covering range of .data + .bss (they are adjacent in practice) */
-    if (data.start && bss.start) {
-        t->globals_rng.start = data.start < bss.start ? data.start : bss.start;
-        t->globals_rng.end   = data.end   > bss.end   ? data.end   : bss.end;
-    } else if (data.start) {
-        t->globals_rng = data;
-    } else {
-        t->globals_rng = bss;
-    }
+    t->globals_rng = wr;
     if (t->globals_rng.end - t->globals_rng.start > CV_GLOBALS_MAX)
         t->globals_rng.end = t->globals_rng.start + CV_GLOBALS_MAX;
+
+    /* read-only sections: load the bytes once, straight from the file */
+    size_t tlen = t->text.end - t->text.start;
+    if (tlen > CV_STATIC_SEC_MAX) {
+        tlen = CV_STATIC_SEC_MAX;
+        t->text.end = t->text.start + tlen;
+    }
+    t->text_bytes = malloc(tlen);
+    if (t->text_bytes)
+        memcpy(t->text_bytes, (const char *)map + text_off, tlen);
+
+    if (t->rodata_rng.end > t->rodata_rng.start) {
+        size_t rlen = t->rodata_rng.end - t->rodata_rng.start;
+        if (rlen > CV_STATIC_SEC_MAX) {
+            rlen = CV_STATIC_SEC_MAX;
+            t->rodata_rng.end = t->rodata_rng.start + rlen;
+        }
+        t->rodata_bytes = malloc(rlen);
+        if (t->rodata_bytes)
+            memcpy(t->rodata_bytes, (const char *)map + ro_off, rlen);
+    }
 
     t->entry = eh->e_entry;
     rc = 0;
@@ -484,7 +511,7 @@ void analyze_dump(const trace_t *t)
     printf("== ELF ==\n");
     printf(".text        : 0x%llx - 0x%llx\n",
            (unsigned long long)t->text.start, (unsigned long long)t->text.end);
-    printf(".data+.bss   : 0x%llx - 0x%llx (%llu bytes)\n",
+    printf(".got/.data/.bss: 0x%llx - 0x%llx (%llu bytes)\n",
            (unsigned long long)t->globals_rng.start,
            (unsigned long long)t->globals_rng.end,
            (unsigned long long)(t->globals_rng.end - t->globals_rng.start));

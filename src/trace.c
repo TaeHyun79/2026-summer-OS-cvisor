@@ -147,5 +147,7 @@ void trace_free(trace_t *t)
     free(t->prog_output);
     free(t->chunks);
     free(t->scs);
+    free(t->text_bytes);
+    free(t->rodata_bytes);
     memset(t, 0, sizeof(*t));
 }

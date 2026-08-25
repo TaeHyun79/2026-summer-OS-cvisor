@@ -25,6 +25,7 @@
 #define CV_GLOBALS_MAX       65536   /* .data + .bss covering range cap */
 #define CV_HEAP_RECHECK      128     /* re-read /proc/pid/maps every N steps */
 #define CV_MAX_HEAPR         8       /* tracked heap regions: [heap] + mmaps */
+#define CV_STATIC_SEC_MAX    (1u << 20) /* .text/.rodata load cap (bytes) */
 #define CV_MMAP_TRACK_MAX    (16u << 20) /* ignore anon mmaps larger than this */
 
 /* ---------- static analysis ---------- */
@@ -94,7 +95,12 @@ typedef struct {
     char      **src;     int    n_src;
     char        src_file[512];
     range_t     text;
-    range_t     globals_rng;   /* covering range of .data + .bss */
+    range_t     globals_rng;   /* covering range of .got + .data + .bss */
+    range_t     rodata_rng;    /* .rodata, 0/0 if absent */
+    uint8_t    *text_bytes;    /* read-only sections, loaded once from the
+                                * ELF file — identical at runtime (-no-pie,
+                                * mapped r-x / r--), so no per-step snapshot */
+    uint8_t    *rodata_bytes;
     uint64_t    main_addr;     /* 0 if not found */
     uint64_t    entry;
 

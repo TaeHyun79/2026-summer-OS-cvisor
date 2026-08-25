@@ -12,7 +12,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PANE_STACK = 0, PANE_HEAP, PANE_GLOBALS, PANE_N };
+enum { PANE_STACK = 0, PANE_HEAP, PANE_GLOBALS, PANE_RODATA, PANE_CODE,
+       PANE_N };
+
+/* wide layout: 4x2 grid with every memory section visible at once.
+ * Kicks in when the terminal is at least this big — roughly 2/3 of a
+ * typical fullscreen terminal, and wide enough that each of the 4 columns
+ * fits a hex row (12 addr + 24 hex + borders).  The true screen maximum is
+ * not queryable from inside a terminal, so this is a fixed threshold. */
+#define WIDE_MIN_COLS  160
+#define WIDE_MIN_LINES 34
 
 enum {
     CP_CUR = 1,   /* current source line / instruction */
@@ -31,7 +40,9 @@ typedef struct {
     int      stack_desc;            /* 1 = high addresses on top (CSAPP) */
     int      show_out;
     int      show_sys;              /* syscall log overlay */
+    int      wide;                  /* 4x2 layout: all memory panes shown */
     WINDOW  *wsrc, *wasm, *wreg, *wmem, *wout, *wsys;
+    WINDOW  *wmems[PANE_N];         /* wide mode: one window per section */
 } ui_t;
 
 /* ---------------- helpers ---------------- */
@@ -66,15 +77,21 @@ static int step_byte(const trace_t *t, const step_t *s, uint64_t addr,
     return -1;
 }
 
-static void draw_frame(WINDOW *w, const char *title)
+static void draw_frame_f(WINDOW *w, const char *title, int focus)
 {
     werase(w);
     box(w, 0, 0);
     if (title) {
-        wattron(w, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        int attr = COLOR_PAIR(CP_TITLE) | A_BOLD | (focus ? A_REVERSE : 0);
+        wattron(w, attr);
         mvwprintw(w, 0, 2, " %.*s ", getmaxx(w) - 6, title);
-        wattroff(w, COLOR_PAIR(CP_TITLE) | A_BOLD);
+        wattroff(w, attr);
     }
+}
+
+static void draw_frame(WINDOW *w, const char *title)
+{
+    draw_frame_f(w, title, 0);
 }
 
 /* first index so that `pos` stays roughly centered in `visible` rows */
@@ -228,54 +245,86 @@ static void draw_reg(ui_t *u)
 
 /* ---------------- memory panel ---------------- */
 
-static void mem_region(ui_t *u, uint64_t *base, size_t *len,
+static void mem_region(ui_t *u, int pane, uint64_t *base, size_t *len,
                        const uint8_t **buf, const char **name)
 {
     const step_t *s = cur_step(u);
-    if (u->mem_pane == PANE_STACK) {
+    const trace_t *t = u->t;
+    switch (pane) {
+    case PANE_STACK:
         *base = s->stack_base; *len = s->stack_len; *buf = s->stack;
         *name = "stack";
-    } else {
-        *base = u->t->globals_rng.start; *len = s->globals_len;
-        *buf = s->globals; *name = "globals (.data/.bss)";
+        break;
+    case PANE_RODATA: /* read-only: loaded once from the ELF, never changes */
+        *base = t->rodata_rng.start;
+        *len  = t->rodata_bytes ? t->rodata_rng.end - t->rodata_rng.start : 0;
+        *buf  = t->rodata_bytes;
+        *name = "rodata (string literals, constants)";
+        break;
+    case PANE_CODE:
+        *base = t->text.start;
+        *len  = t->text_bytes ? t->text.end - t->text.start : 0;
+        *buf  = t->text_bytes;
+        *name = "code (.text machine bytes)";
+        break;
+    default:
+        *base = t->globals_rng.start; *len = s->globals_len;
+        *buf = s->globals; *name = "globals (.got/.data/.bss)";
+        break;
     }
 }
 
-/* one hex row of 8 bytes with per-byte change highlighting */
-static void draw_hex_row(ui_t *u, int y, uint64_t row_addr,
-                         uint64_t base, size_t len)
+/* one hex row of 8 bytes with per-byte change highlighting and an ASCII
+ * column; sbuf != NULL means a static section (bytes from the ELF file,
+ * never change) instead of per-step snapshots */
+static void draw_hex_row(ui_t *u, WINDOW *w, int y, uint64_t row_addr,
+                         uint64_t base, size_t len, const uint8_t *sbuf)
 {
     const step_t *s = cur_step(u), *p = prev_step(u);
-    mvwprintw(u->wmem, y, 1, "%012llx ", (unsigned long long)row_addr);
+    char ascii[9] = "        ";
+    mvwprintw(w, y, 1, "%012llx ", (unsigned long long)row_addr);
     for (int b = 0; b < 8; b++) {
         uint64_t a = row_addr + (uint64_t)b;
         uint8_t v;
-        if (a < base || a >= base + len || step_byte(u->t, s, a, &v) < 0) {
-            wprintw(u->wmem, " ..");
+        int have, changed = 0;
+        if (a < base || a >= base + len) {
+            have = 0;
+        } else if (sbuf) {
+            v = sbuf[a - base];
+            have = 1;
+        } else {
+            have = (step_byte(u->t, s, a, &v) == 0);
+            uint8_t pv;
+            changed = (have && u->cur > 0 &&
+                       (step_byte(u->t, p, a, &pv) < 0 || pv != v));
+        }
+        if (!have) {
+            wprintw(w, " ..");
             continue;
         }
-        uint8_t pv;
-        int changed = (u->cur > 0 &&
-                       (step_byte(u->t, p, a, &pv) < 0 || pv != v));
+        ascii[b] = (v >= 0x20 && v < 0x7f) ? (char)v : '.';
         if (changed)
-            wattron(u->wmem, COLOR_PAIR(CP_CHG) | A_BOLD);
-        wprintw(u->wmem, " %02x", v);
+            wattron(w, COLOR_PAIR(CP_CHG) | A_BOLD);
+        wprintw(w, " %02x", v);
         if (changed)
-            wattroff(u->wmem, COLOR_PAIR(CP_CHG) | A_BOLD);
+            wattroff(w, COLOR_PAIR(CP_CHG) | A_BOLD);
     }
+    if (getmaxx(w) - 2 >= 13 + 24 + 2 + 8)
+        wprintw(w, "  %s", ascii);
 }
 
 /* heap pane: [heap] plus tracked anonymous mmap regions, stacked */
-static void draw_mem_heap(ui_t *u)
+static void draw_mem_heap(ui_t *u, WINDOW *w, int focus)
 {
     const step_t *s = cur_step(u);
-    draw_frame(u->wmem, "heap (brk+mmap)  (Tab: stack/heap/globals)");
-    int h = getmaxy(u->wmem) - 2;
+    draw_frame_f(w, u->wide ? "heap (brk+mmap)"
+                            : "heap (brk+mmap)  (Tab: next pane)", focus);
+    int h = getmaxy(w) - 2;
     if (h <= 0)
         return;
     if (s->n_heapr == 0) {
-        mvwprintw(u->wmem, 1, 2, "(no heap region at this step)");
-        wnoutrefresh(u->wmem);
+        mvwprintw(w, 1, 2, "(no heap region at this step)");
+        wnoutrefresh(w);
         return;
     }
 
@@ -300,38 +349,41 @@ static void draw_mem_heap(ui_t *u)
         const heapreg_t *hr = &s->heapr[r];
         int inner = vrow - reg_first[r];
         if (inner == 0) {
-            wattron(u->wmem, COLOR_PAIR(CP_MARK) | A_BOLD);
-            mvwprintw(u->wmem, 1 + i, 1, "== %s 0x%llx (%zu bytes) ==",
+            wattron(w, COLOR_PAIR(CP_MARK) | A_BOLD);
+            mvwprintw(w, 1 + i, 1, "== %s 0x%llx (%zu bytes) ==",
                       r == 0 ? "region" : "mmap",
                       (unsigned long long)hr->base, hr->len);
-            wattroff(u->wmem, COLOR_PAIR(CP_MARK) | A_BOLD);
+            wattroff(w, COLOR_PAIR(CP_MARK) | A_BOLD);
         } else {
             uint64_t row_addr = hr->base + (uint64_t)(inner - 1) * 8;
-            draw_hex_row(u, 1 + i, row_addr, hr->base, hr->len);
+            draw_hex_row(u, w, 1 + i, row_addr, hr->base, hr->len, NULL);
         }
     }
-    wnoutrefresh(u->wmem);
+    wnoutrefresh(w);
 }
 
-static void draw_mem(ui_t *u)
+/* draw one memory section into the given window; `focus` highlights the
+ * pane that Tab has selected for scrolling (wide mode) */
+static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
 {
-    if (u->mem_pane == PANE_HEAP) {
-        draw_mem_heap(u);
+    if (pane == PANE_HEAP) {
+        draw_mem_heap(u, w, focus);
         return;
     }
     uint64_t base; size_t len; const uint8_t *buf; const char *name;
-    mem_region(u, &base, &len, &buf, &name);
+    mem_region(u, pane, &base, &len, &buf, &name);
 
-    char title[64];
-    snprintf(title, sizeof(title), "%s  (Tab: stack/heap/globals)", name);
-    draw_frame(u->wmem, title);
+    char title[80];
+    snprintf(title, sizeof(title), "%s%s", name,
+             u->wide ? "" : "  (Tab: next pane)");
+    draw_frame_f(w, title, focus);
 
-    int h = getmaxy(u->wmem) - 2, w = getmaxx(u->wmem) - 2;
+    int h = getmaxy(w) - 2;
     if (h <= 0)
         return;
     if (!buf || len == 0) {
-        mvwprintw(u->wmem, 1, 2, "(no %s region at this step)", name);
-        wnoutrefresh(u->wmem);
+        mvwprintw(w, 1, 2, "(no %s region at this step)", name);
+        wnoutrefresh(w);
         return;
     }
 
@@ -340,43 +392,52 @@ static void draw_mem(ui_t *u)
     uint64_t hi = (base + len + 7) & ~(uint64_t)7;
     int nrows = (int)((hi - lo) / 8);
 
-    /* pick centering anchor: RSP row for the stack, start otherwise */
+    /* centering anchor: RSP row for the stack, RIP row for code */
     int anchor = 0;
-    if (u->mem_pane == PANE_STACK && s->regs.rsp >= lo && s->regs.rsp < hi)
+    if (pane == PANE_STACK && s->regs.rsp >= lo && s->regs.rsp < hi)
         anchor = (int)((s->regs.rsp - lo) / 8);
-    int descending = (u->mem_pane == PANE_STACK && u->stack_desc);
+    if (pane == PANE_CODE && s->regs.rip >= lo && s->regs.rip < hi)
+        anchor = (int)((s->regs.rip - lo) / 8);
+    int descending = (pane == PANE_STACK && u->stack_desc);
     int anchor_disp = descending ? nrows - 1 - anchor : anchor;
 
-    int first = center_first(anchor_disp, nrows, h) + u->mem_scroll[u->mem_pane];
+    int first = center_first(anchor_disp, nrows, h) + u->mem_scroll[pane];
     if (first > nrows - h)
         first = nrows - h;
     if (first < 0)
         first = 0;
-    u->mem_scroll[u->mem_pane] = first - center_first(anchor_disp, nrows, h);
+    u->mem_scroll[pane] = first - center_first(anchor_disp, nrows, h);
 
     for (int i = 0; i < h && first + i < nrows; i++) {
         int disp = first + i;
         int rowi = descending ? nrows - 1 - disp : disp;
         uint64_t row_addr = lo + (uint64_t)rowi * 8;
 
-        draw_hex_row(u, 1 + i, row_addr, base, len);
+        const uint8_t *sbuf =
+            (pane == PANE_CODE)   ? u->t->text_bytes :
+            (pane == PANE_RODATA) ? u->t->rodata_bytes : NULL;
+        draw_hex_row(u, w, 1 + i, row_addr, base, len, sbuf);
 
-        /* RSP/RBP markers */
-        if (u->mem_pane == PANE_STACK) {
+        /* RSP/RBP markers on the stack, RIP marker on the code bytes */
+        if (pane == PANE_STACK) {
             int has_rsp = s->regs.rsp >= row_addr && s->regs.rsp < row_addr + 8;
             int has_rbp = s->regs.rbp >= row_addr && s->regs.rbp < row_addr + 8;
             if (has_rsp || has_rbp) {
-                wattron(u->wmem, COLOR_PAIR(CP_MARK) | A_BOLD);
-                wprintw(u->wmem, " <-%s%s%s",
+                wattron(w, COLOR_PAIR(CP_MARK) | A_BOLD);
+                wprintw(w, " <-%s%s%s",
                         has_rsp ? "RSP" : "",
                         (has_rsp && has_rbp) ? "," : "",
                         has_rbp ? "RBP" : "");
-                wattroff(u->wmem, COLOR_PAIR(CP_MARK) | A_BOLD);
+                wattroff(w, COLOR_PAIR(CP_MARK) | A_BOLD);
             }
+        } else if (pane == PANE_CODE &&
+                   s->regs.rip >= row_addr && s->regs.rip < row_addr + 8) {
+            wattron(w, COLOR_PAIR(CP_MARK) | A_BOLD);
+            wprintw(w, " <-RIP");
+            wattroff(w, COLOR_PAIR(CP_MARK) | A_BOLD);
         }
-        (void)w;
     }
-    wnoutrefresh(u->wmem);
+    wnoutrefresh(w);
 }
 
 /* ---------------- output overlay ---------------- */
@@ -506,7 +567,9 @@ static void draw_status(ui_t *u)
              u->cur, t->n_steps - 1, skipbuf,
              u->mode_src ? "SRC " : "INSN",
              u->mem_pane == PANE_STACK ? "stack" :
-             u->mem_pane == PANE_HEAP ? "heap" : "globals",
+             u->mem_pane == PANE_HEAP ? "heap" :
+             u->mem_pane == PANE_GLOBALS ? "globals" :
+             u->mem_pane == PANE_RODATA ? "rodata" : "code",
              t->truncated ? " | TRUNCATED" : "");
     mvprintw(LINES - 1, 0, "%-.*s", COLS, left);
 
@@ -550,22 +613,43 @@ static void destroy_windows(ui_t *u)
     if (u->wout) delwin(u->wout);
     if (u->wsys) delwin(u->wsys);
     u->wsrc = u->wasm = u->wreg = u->wmem = u->wout = u->wsys = NULL;
+    for (int i = 0; i < PANE_N; i++) {
+        if (u->wmems[i])
+            delwin(u->wmems[i]);
+        u->wmems[i] = NULL;
+    }
 }
 
 static void make_windows(ui_t *u)
 {
     destroy_windows(u);
     int usable = LINES - 1;
-    int top_h = usable * 55 / 100;
-    if (top_h < 5)
-        top_h = usable > 5 ? 5 : usable;
-    int bot_h = usable - top_h;
-    int left_w = COLS / 2;
+    u->wide = (COLS >= WIDE_MIN_COLS && LINES >= WIDE_MIN_LINES);
 
-    u->wsrc = newwin(top_h, left_w, 0, 0);
-    u->wasm = newwin(top_h, COLS - left_w, 0, left_w);
-    u->wreg = newwin(bot_h, left_w, top_h, 0);
-    u->wmem = newwin(bot_h, COLS - left_w, top_h, left_w);
+    if (u->wide) {
+        /* 4x2: src | asm | reg | stack  //  heap | globals | rodata | code */
+        int top_h = usable / 2;
+        int bot_h = usable - top_h;
+        int cw = COLS / 4;
+        u->wsrc = newwin(top_h, cw, 0, 0);
+        u->wasm = newwin(top_h, cw, 0, cw);
+        u->wreg = newwin(top_h, cw, 0, 2 * cw);
+        u->wmems[PANE_STACK]   = newwin(top_h, COLS - 3 * cw, 0, 3 * cw);
+        u->wmems[PANE_HEAP]    = newwin(bot_h, cw, top_h, 0);
+        u->wmems[PANE_GLOBALS] = newwin(bot_h, cw, top_h, cw);
+        u->wmems[PANE_RODATA]  = newwin(bot_h, cw, top_h, 2 * cw);
+        u->wmems[PANE_CODE]    = newwin(bot_h, COLS - 3 * cw, top_h, 3 * cw);
+    } else {
+        int top_h = usable * 55 / 100;
+        if (top_h < 5)
+            top_h = usable > 5 ? 5 : usable;
+        int bot_h = usable - top_h;
+        int left_w = COLS / 2;
+        u->wsrc = newwin(top_h, left_w, 0, 0);
+        u->wasm = newwin(top_h, COLS - left_w, 0, left_w);
+        u->wreg = newwin(bot_h, left_w, top_h, 0);
+        u->wmem = newwin(bot_h, COLS - left_w, top_h, left_w);
+    }
     if (u->show_out) {
         int oh = usable / 2;
         u->wout = newwin(oh, COLS, usable - oh, 0);
@@ -583,7 +667,12 @@ static void redraw(ui_t *u)
     draw_src(u);
     draw_asm(u);
     draw_reg(u);
-    draw_mem(u);
+    if (u->wide) {
+        for (int p = 0; p < PANE_N; p++)
+            draw_mem_one(u, u->wmems[p], p, p == u->mem_pane);
+    } else {
+        draw_mem_one(u, u->wmem, u->mem_pane, 0);
+    }
     if (u->show_out)
         draw_out(u);
     if (u->show_sys)

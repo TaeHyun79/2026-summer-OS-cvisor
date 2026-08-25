@@ -1,19 +1,13 @@
-# Build artifacts
-cvisor
-src/*.o
+# IDE / build dirs
+.idea/
+cmake-build-debug/
+
+# build artifacts (binaries have no extension; keep sources only)
+*.o
+/cvisor
 tests/*
 !tests/*.c
 !tests/*.s
 ch6/*
 !ch6/*.c
 !ch6/*.s
-
-# CMake / CLion
-cmake-build-*/
-.idea/
-
-# Local VM config
-vm/
-
-# macOS
-.DS_Store

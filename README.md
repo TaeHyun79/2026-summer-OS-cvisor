@@ -78,7 +78,7 @@ Running cvisor does: (1) static analysis (objdump/ELF parsing) →
 | `→` / `n` | next step |
 | `←` / `p` | previous step |
 | `m` | toggle step mode (instruction ↔ source line) |
-| `Tab` | cycle memory pane (stack → heap → globals) |
+| `Tab` | cycle memory pane (stack → heap → globals → rodata → code); in the wide layout it moves scroll focus instead |
 | `↑` / `↓` | scroll the memory pane |
 | `d` | toggle stack direction (default: high addresses on top, CSAPP style) |
 | `g` | jump to a step number |
@@ -87,6 +87,16 @@ Running cvisor does: (1) static analysis (objdump/ELF parsing) →
 | `s` | syscall log panel (number, args, return value, up to this step) |
 | `f` | advance to the next call/ret instruction |
 | `q` | quit |
+
+### Layout
+
+The layout adapts to the terminal size. On a large terminal (≥ 160 cols and
+≥ 34 lines — roughly two-thirds of a typical fullscreen terminal; tunable via
+`WIDE_MIN_COLS`/`WIDE_MIN_LINES` in `src/tui.c`) cvisor switches to a **4×2
+grid** showing every memory section at once — source, disassembly, registers,
+stack on top; heap, globals, rodata, code below — and `Tab` selects which
+pane the `↑`/`↓` scroll keys act on (highlighted title). On smaller terminals
+it uses the classic 2×2 layout with a single memory pane cycled by `Tab`.
 
 ### What the display tells you
 
@@ -100,6 +110,12 @@ Running cvisor does: (1) static analysis (objdump/ELF parsing) →
   inside that gap (e.g. the `write` behind `printf`) appear in the `s` panel.
 - **Heap pane** shows the brk-based `[heap]` *and* anonymous rw `mmap`
   regions observed during recording (large mallocs), each with a header row.
+- **All of the program image is browsable**: `globals` covers
+  `.got/.data/.bss` (watch a GOT entry flip on the first `printf` — lazy
+  binding, live), `rodata` shows string literals/constants, and `code` shows
+  the raw `.text` machine bytes with a `<-RIP` marker following execution.
+  Every hex pane has an ASCII column. (`.text`/`.rodata` are read-only
+  mappings, loaded once from the ELF file.)
 - **fork/clone/execve** are detected and flagged in the status bar; child
   processes are not followed (Phase 3).
 - **Crashes**: on SIGSEGV etc. the faulting state is the last recorded step;
@@ -206,7 +222,7 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 | `→` / `n` | 다음 스텝 |
 | `←` / `p` | 이전 스텝 |
 | `m` | 스텝 모드 토글 (명령어 ↔ 소스 줄) |
-| `Tab` | 메모리 패널 전환 (stack → heap → globals) |
+| `Tab` | 메모리 패널 전환 (stack → heap → globals → rodata → code); 와이드 레이아웃에서는 스크롤 포커스 이동 |
 | `↑` / `↓` | 메모리 패널 스크롤 |
 | `d` | 스택 방향 토글 (기본: 높은 주소가 위 = CSAPP 방향) |
 | `g` | 스텝 번호 입력 후 점프 |
@@ -215,6 +231,16 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 | `s` | 시스템 콜 로그 패널 (번호/인자/반환값, 현재 스텝까지) |
 | `f` | 다음 call/ret 명령어까지 전진 |
 | `q` | 종료 |
+
+### 레이아웃
+
+터미널 크기에 따라 레이아웃이 자동으로 바뀝니다. 큰 터미널(가로 160컬럼·세로
+34줄 이상 — 일반적인 풀스크린 터미널의 약 2/3 크기, `src/tui.c`의
+`WIDE_MIN_COLS`/`WIDE_MIN_LINES`로 조절 가능)에서는 **4×2 그리드**로 전환되어
+모든 메모리 섹션이 한 번에 보입니다 — 윗줄: 소스·디스어셈블리·레지스터·스택,
+아랫줄: heap·globals·rodata·code. 이때 `Tab`은 `↑`/`↓` 스크롤이 적용될 패널을
+선택합니다(타이틀 하이라이트). 그보다 작으면 기존 2×2 레이아웃에서 `Tab`으로
+메모리 패널을 순환합니다.
 
 ### 화면 읽는 법
 
@@ -227,6 +253,11 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
   볼 수 있습니다.
 - **힙 패널**은 brk 기반 `[heap]`과 기록 중 관측된 익명 rw `mmap` 영역(큰
   malloc)을 구역 헤더와 함께 보여줍니다.
+- **프로그램 이미지 전체를 볼 수 있습니다**: `globals`는 `.got/.data/.bss`를
+  포함하고(첫 `printf` 호출 때 GOT 엔트리가 바뀌는 lazy binding이 실시간으로
+  보임), `rodata`는 문자열 리터럴/상수, `code`는 `.text`의 실제 기계어 바이트를
+  `<-RIP` 마커와 함께 보여줍니다. 모든 hex 패널에 ASCII 컬럼이 있습니다.
+  (`.text`/`.rodata`는 읽기 전용 매핑이라 ELF 파일에서 1회만 로드)
 - **fork/clone/execve**가 감지되면 상태바에 경고가 뜹니다. 자식 프로세스 추적은
   Phase 3입니다.
 - **크래시**: SIGSEGV 등으로 죽으면 마지막 기록 스텝이 죽기 직전 상태입니다.
