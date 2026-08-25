@@ -12,7 +12,7 @@ the target environment, build flags, and on-screen layout are chosen so that
 what you see matches the textbook figures 1:1.
 
 ```
-┌─ factorial.c ────────────┬─ disassembly ───────────────┐
+┌─ showcase.c ─────────────┬─ disassembly ───────────────┐
 │  5      if (n <= 1)      │  40113e: mov -0x4(%rbp),%eax│
 │> 6          return 1;    │> 401141: cmp $0x1,%eax      │
 ├─ registers ──────────────┼─ stack ─────────────────────┤
@@ -132,13 +132,7 @@ it uses the classic 2×2 layout with a single memory pane cycled by `Tab`.
 
 | File | What to watch |
 |---|---|
-| `showcase.c` | **start here** — one short run that changes every pane, phase by phase (see its header comment) |
-| `factorial.c` | recursion: frames stacking up in the stack pane |
-| `args3.c` | RDI/RSI/RDX argument passing, call/ret stack motion |
-| `globals.c` | initialized `.data` vs zeroed `.bss` |
-| `heap.c` | bounded OSTEP `intro/mem.c`: heap pointer and value updates |
-| `bigheap.c` | a 1 MB malloc served by `mmap`, visible as its own region |
-| `crash.c` | NULL-pointer write: rewind-from-crash workflow |
+| `showcase.c` | **start here** — one short run that changes every pane, phase by phase: register/EFLAGS churn, recursion frames, `.bss` writes, brk-heap fills, a 1 MB `mmap` region appearing and vanishing, the GOT flip + `write` syscall on the first `printf` (see its header comment) |
 
 ## Project layout
 
@@ -275,13 +269,7 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 
 | 파일 | 관찰 포인트 |
 |---|---|
-| `showcase.c` | **여기서 시작** — 한 번의 짧은 실행으로 모든 패널이 단계별로 변함 (파일 상단 주석 참조) |
-| `factorial.c` | 재귀: 스택 패널에 프레임이 쌓이는 모습 |
-| `args3.c` | RDI/RSI/RDX 인자 전달, call/ret 스택 변화 |
-| `globals.c` | .data(초기화)와 .bss(0)의 차이 |
-| `heap.c` | OSTEP `intro/mem.c` 축소판: 힙 포인터/값 변화 |
-| `bigheap.c` | 1MB malloc이 `mmap`으로 처리되어 별도 영역으로 보임 |
-| `crash.c` | 널 포인터 쓰기: 크래시 되감기 시나리오 |
+| `showcase.c` | **여기서 시작** — 한 번의 짧은 실행으로 모든 패널이 단계별로 변함: 레지스터/EFLAGS 변화, 재귀 프레임, `.bss` 쓰기, brk 힙 채우기, 1MB `mmap` 영역의 등장과 소멸, 첫 `printf`의 GOT 플립 + `write` 시스템 콜 (파일 상단 주석 참조) |
 
 ## 코드 구조
 

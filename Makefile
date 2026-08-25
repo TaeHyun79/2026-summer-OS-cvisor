@@ -81,10 +81,9 @@ ch6/%: ch6/%.s
 	rm -f $@.o
 
 check: cvisor tests
-	./cvisor --dump tests/factorial > /dev/null && echo "dump: OK"
-	./cvisor --trace tests/factorial | tail -3
-	./cvisor --trace --from-main tests/globals | tail -3
-	./cvisor --trace --from-main tests/crash | tail -3
+	./cvisor --dump tests/showcase > /dev/null && echo "dump: OK"
+	./cvisor --trace tests/showcase | tail -3
+	./cvisor --trace --from-main tests/showcase | tail -3
 
 clean:
 	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) \
