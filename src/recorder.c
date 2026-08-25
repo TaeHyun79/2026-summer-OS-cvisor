@@ -22,8 +22,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -67,8 +69,6 @@ typedef struct {
     int       from_main;
     size_t    max_steps;
     int       out_fd;
-    struct { pid_t pid; int status; } pend[16];
-    int       n_pend;
 } rec_t;
 
 /* ---------------- target memory access ---------------- */
@@ -144,14 +144,11 @@ static void drain_output(rec_t *r, uint64_t gseq)
             break;
         size_t off = t->out_len;
         trace_append_output(t, buf, (size_t)n);
-        if (t->n_chunks == t->cap_chunks) {
-            size_t ncap = t->cap_chunks ? t->cap_chunks * 2 : 64;
-            outchunk_t *nc = realloc(t->chunks, ncap * sizeof(outchunk_t));
-            if (!nc)
-                return;
-            t->chunks = nc;
-            t->cap_chunks = ncap;
-        }
+        outchunk_t *nc = cv_grow(t->chunks, t->n_chunks, &t->cap_chunks,
+                                 sizeof(outchunk_t), 64);
+        if (!nc)
+            return;
+        t->chunks = nc;
         t->chunks[t->n_chunks++] = (outchunk_t){ gseq, off, (size_t)n };
     }
 }
@@ -236,15 +233,10 @@ static void handle_syscall(rec_t *r, tracee_t *tr, int64_t ret)
     const pending_sc_t *p = &tr->psc;
 
     if (tr->recording && tr->proc >= 0) {
-        if (t->n_scs == t->cap_scs) {
-            size_t ncap = t->cap_scs ? t->cap_scs * 2 : 64;
-            scevent_t *ns = realloc(t->scs, ncap * sizeof(scevent_t));
-            if (ns) {
-                t->scs = ns;
-                t->cap_scs = ncap;
-            }
-        }
-        if (t->n_scs < t->cap_scs) {
+        scevent_t *ns = cv_grow(t->scs, t->n_scs, &t->cap_scs,
+                                sizeof(scevent_t), 64);
+        if (ns) {
+            t->scs = ns;
             proc_t *pp = &t->procs[tr->proc];
             scevent_t *e = &t->scs[t->n_scs++];
             e->proc = tr->proc;
@@ -256,14 +248,15 @@ static void handle_syscall(rec_t *r, tracee_t *tr, int64_t ret)
     }
 
     switch (p->nr) {
-    case 12: /* brk: [heap] may have just appeared or grown */
+    case SYS_brk: /* [heap] may have just appeared or grown */
         maps_find(tr->pid, "[heap]", &tr->brk_heap);
         break;
-    case 9: { /* mmap: track anonymous writable mappings (big mallocs);
-               * only while recording, so loader-internal mmaps stay out */
+    case SYS_mmap: { /* track anonymous writable mappings (big mallocs);
+                      * only while recording, so loader-internal mmaps
+                      * stay out */
         uint64_t uret = (uint64_t)ret;
-        int anon     = (p->args[3] & 0x20) != 0; /* MAP_ANONYMOUS */
-        int writable = (p->args[2] & 0x2)  != 0; /* PROT_WRITE */
+        int anon     = (p->args[3] & MAP_ANONYMOUS) != 0;
+        int writable = (p->args[2] & PROT_WRITE)    != 0;
         if (tr->recording && uret < 0xfffffffffffff000ULL && anon &&
             writable && p->args[1] > 0 && p->args[1] <= CV_MMAP_TRACK_MAX &&
             tr->n_anonr < CV_MAX_HEAPR - 1) {
@@ -272,7 +265,7 @@ static void handle_syscall(rec_t *r, tracee_t *tr, int64_t ret)
         }
         break;
     }
-    case 11: { /* munmap: forget tracked regions inside the range */
+    case SYS_munmap: { /* forget tracked regions inside the range */
         uint64_t lo = p->args[0], hi = p->args[0] + p->args[1];
         for (int i = 0; i < tr->n_anonr; ) {
             if (tr->anonr[i].start >= lo && tr->anonr[i].end <= hi)
@@ -320,7 +313,7 @@ static void close_tracee(tracee_t *tr)
     tr->alive = 0;
 }
 
-static int process_and_resume(rec_t *r, tracee_t *tr, int deliver_sig);
+static int process_and_resume(rec_t *r, tracee_t *tr);
 
 /* register a newly forked child, inheriting the parent's context (COW
  * address space: same stack top, same heap regions, same image) */
@@ -366,7 +359,7 @@ static int register_child(rec_t *r, tracee_t *parent, pid_t cpid)
         ct->pending_stop = 0;
         ct->fresh = 0;
         if (ptrace(PTRACE_GETREGS, cpid, 0, &ct->regs) == 0 &&
-            process_and_resume(r, ct, 0) < 0)
+            process_and_resume(r, ct) < 0)
             return -1;
     }
     return 0;
@@ -375,7 +368,7 @@ static int register_child(rec_t *r, tracee_t *parent, pid_t cpid)
 /* ---------------- per-stop processing ---------------- */
 
 /* returns -1 when the global step cap is hit */
-static int process_and_resume(rec_t *r, tracee_t *tr, int deliver_sig)
+static int process_and_resume(rec_t *r, tracee_t *tr)
 {
     trace_t *t = r->t;
     const image_t *im = t->images[tr->img];
@@ -409,10 +402,20 @@ static int process_and_resume(rec_t *r, tracee_t *tr, int deliver_sig)
         tr->skipped++;
     }
 
-    /* is the instruction about to execute a `syscall` (0f 05)? */
+    /* is the instruction about to execute a `syscall` (0f 05)?  Inside
+     * the image's .text the bytes are already loaded (read-only mapping,
+     * identical at runtime), which saves one process_vm_readv per step;
+     * read_mem remains the fallback for libc addresses */
     uint8_t op[2];
-    if (read_mem(tr, tr->regs.rip, op, 2) == 2 &&
-        op[0] == 0x0f && op[1] == 0x05) {
+    int have_op;
+    uint64_t rip = tr->regs.rip;
+    if (im->text_bytes && rip >= im->text.start && rip + 2 <= im->text.end) {
+        memcpy(op, im->text_bytes + (rip - im->text.start), 2);
+        have_op = 1;
+    } else {
+        have_op = (read_mem(tr, rip, op, 2) == 2);
+    }
+    if (have_op && op[0] == 0x0f && op[1] == 0x05) {
         tr->psc.active = 1;
         tr->psc.nr = (int64_t)tr->regs.rax;
         tr->psc.args[0] = tr->regs.rdi; tr->psc.args[1] = tr->regs.rsi;
@@ -420,7 +423,7 @@ static int process_and_resume(rec_t *r, tracee_t *tr, int deliver_sig)
         tr->psc.args[4] = tr->regs.r8;  tr->psc.args[5] = tr->regs.r9;
     }
 
-    ptrace(PTRACE_SINGLESTEP, tr->pid, 0, deliver_sig);
+    ptrace(PTRACE_SINGLESTEP, tr->pid, 0, 0);
     return 0;
 }
 
@@ -488,8 +491,9 @@ static void handle_exec(rec_t *r, tracee_t *tr)
     }
     tr->stack_top = tr->regs.rsp + CV_STACK_ABOVE_RSP0;
     tr->recording = !r->from_main;
-    if (process_and_resume(r, tr, 0) < 0)
-        t->truncated = 1; /* caller notices via t->truncated */
+    /* on a cap hit process_and_resume set t->truncated; the record()
+     * loop checks it right after this call */
+    process_and_resume(r, tr);
 }
 
 /* ---------------- main record loop ---------------- */
@@ -582,7 +586,7 @@ int record(trace_t *t, const char *target_path, char *const argv[],
     root->stack_top = root->regs.rsp + CV_STACK_ABOVE_RSP0;
 
     fprintf(stderr, "Recording... ");
-    if (process_and_resume(&r, root, 0) < 0)
+    if (process_and_resume(&r, root) < 0)
         goto done_truncated;
 
     while (any_alive(&r)) {
@@ -658,7 +662,7 @@ int record(trace_t *t, const char *target_path, char *const argv[],
                 }
                 if (register_child(&r, tr, (pid_t)cpid) < 0)
                     goto done_truncated;
-                if (process_and_resume(&r, tr, 0) < 0)
+                if (process_and_resume(&r, tr) < 0)
                     goto done_truncated;
             }
             continue;
@@ -680,7 +684,7 @@ int record(trace_t *t, const char *target_path, char *const argv[],
                 ptrace(PTRACE_CONT, wpid, 0, 0);
                 continue;
             }
-            if (process_and_resume(&r, tr, 0) < 0)
+            if (process_and_resume(&r, tr) < 0)
                 goto done_truncated;
             continue;
         }
@@ -742,17 +746,15 @@ void record_dump(const trace_t *t)
 {
     for (int pi = 0; pi < t->n_procs; pi++) {
         const proc_t *p = &t->procs[pi];
+        const char *exsuf =
+            !p->execed  ? ""
+            : p->followed ? " | exec'd (followed)"
+                          : " | exec'd (NOT followed)";
         if (p->parent < 0)
-            printf("=== proc %d | pid %d | root%s ===\n", pi, p->pid,
-                   p->execed ? (p->followed ? " | exec'd (followed)"
-                                            : " | exec'd (NOT followed)")
-                             : "");
+            printf("=== proc %d | pid %d | root%s ===\n", pi, p->pid, exsuf);
         else
             printf("=== proc %d | pid %d | child of proc %d (pid %d)%s ===\n",
-                   pi, p->pid, p->parent, t->procs[p->parent].pid,
-                   p->execed ? (p->followed ? " | exec'd (followed)"
-                                            : " | exec'd (NOT followed)")
-                             : "");
+                   pi, p->pid, p->parent, t->procs[p->parent].pid, exsuf);
 
         size_t sc = 0;
         for (size_t i = 0; i < p->n_steps; i++) {
@@ -771,7 +773,7 @@ void record_dump(const trace_t *t)
                 for (int rn = 0; rn < CV_NREGS; rn++) {
                     uint64_t ov = cv_reg(&pv->regs, rn);
                     uint64_t nv = cv_reg(&s->regs, rn);
-                    if (ov != nv && strcmp(CV_REGS[rn].name, "RIP") != 0)
+                    if (ov != nv && rn != CV_REG_RIP)
                         printf(" | %s %llx->%llx", CV_REGS[rn].name,
                                (unsigned long long)ov,
                                (unsigned long long)nv);
@@ -784,16 +786,9 @@ void record_dump(const trace_t *t)
                     continue;
                 if (t->scs[sc].step > i)
                     break;
-                const scevent_t *e = &t->scs[sc];
-                const char *name = cv_syscall_name(e->nr);
-                if (name)
-                    printf("    syscall %s(", name);
-                else
-                    printf("    syscall sys_%lld(", (long long)e->nr);
-                printf("0x%llx, 0x%llx, 0x%llx) = %lld\n",
-                       (unsigned long long)e->args[0],
-                       (unsigned long long)e->args[1],
-                       (unsigned long long)e->args[2], (long long)e->ret);
+                char scbuf[128];
+                cv_format_syscall(&t->scs[sc], scbuf, sizeof(scbuf));
+                printf("    syscall %s\n", scbuf);
             }
         }
 

@@ -235,13 +235,11 @@ static int parse_disasm(image_t *im, const char *path)
         if (add_dline(im, addr, 0, end) < 0)
             goto oom;
 
-        if (im->n_irefs == iref_cap) {
-            iref_cap = iref_cap ? iref_cap * 2 : 1024;
-            insn_ref_t *nr = realloc(im->irefs, iref_cap * sizeof(insn_ref_t));
-            if (!nr)
-                goto oom;
-            im->irefs = nr;
-        }
+        insn_ref_t *nr = cv_grow(im->irefs, im->n_irefs, &iref_cap,
+                                 sizeof(insn_ref_t), 1024);
+        if (!nr)
+            goto oom;
+        im->irefs = nr;
         im->irefs[im->n_irefs].addr = addr;
         im->irefs[im->n_irefs].dline_idx = (int32_t)(im->n_dlines - 1);
         im->n_irefs++;
@@ -307,18 +305,10 @@ static int parse_decodedline(image_t *im, const char *path)
     char line[4096];
     size_t cap = 0;
     while (fgets(line, sizeof(line), fp)) {
-        /* "CU: ./target.c:" — remember compilation unit path */
-        if (strncmp(line, "CU:", 3) == 0) {
-            char *s = line + 3;
-            while (*s == ' ')
-                s++;
-            size_t n = strlen(s);
-            while (n && (s[n-1] == '\n' || s[n-1] == ':' || s[n-1] == ' '))
-                s[--n] = '\0';
-            if (n && im->src_file[0] == '\0')
-                snprintf(im->src_file, sizeof(im->src_file), "%s", s);
+        /* skip "CU: ./target.c:" headers (src_file comes from the row
+         * tokens of the chosen CU below) */
+        if (strncmp(line, "CU:", 3) == 0)
             continue;
-        }
 
         char *tok[64];
         int ntok = 0;
@@ -364,20 +354,15 @@ static int parse_decodedline(image_t *im, const char *path)
         }
 
         if (im->n_lmap == cap) {
-            cap = cap ? cap * 2 : 512;
-            lmap_t *nl = realloc(im->lmap, cap * sizeof(lmap_t));
-            int *nf = realloc(fids, cap * sizeof(int));
-            if (!nl || !nf) {
-                if (nl)
-                    im->lmap = nl;
-                if (nf)
-                    fids = nf;
-                free(fids);
-                pclose(fp);
-                A_ERR("cvisor: out of memory parsing line table\n");
-                return -1;
-            }
+            size_t ncap = cap;
+            lmap_t *nl = cv_grow(im->lmap, im->n_lmap, &ncap,
+                                 sizeof(lmap_t), 512);
+            if (!nl)
+                goto oom;
             im->lmap = nl;
+            int *nf = cv_grow(fids, im->n_lmap, &cap, sizeof(int), 512);
+            if (!nf)
+                goto oom;
             fids = nf;
         }
         im->lmap[im->n_lmap].addr = addr;
@@ -427,6 +412,12 @@ static int parse_decodedline(image_t *im, const char *path)
 
     qsort(im->lmap, im->n_lmap, sizeof(lmap_t), lmap_cmp);
     return 0;
+
+oom:
+    free(fids);
+    pclose(fp);
+    A_ERR("cvisor: out of memory parsing line table\n");
+    return -1;
 }
 
 /* ---------------- source loading ---------------- */
@@ -462,7 +453,7 @@ static int load_source(image_t *im, const char *target_path)
         return -1;
     }
     char line[4096];
-    int cap = 0;
+    size_t cap = 0;
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n && (line[n-1] == '\n' || line[n-1] == '\r'))
@@ -478,15 +469,13 @@ static int load_source(image_t *im, const char *target_path)
         }
         expanded[o] = '\0';
 
-        if (im->n_src == cap) {
-            cap = cap ? cap * 2 : 256;
-            char **ns = realloc(im->src, (size_t)cap * sizeof(char *));
-            if (!ns) {
-                fclose(f);
-                return -1;
-            }
-            im->src = ns;
+        char **ns = cv_grow(im->src, (size_t)im->n_src, &cap,
+                            sizeof(char *), 256);
+        if (!ns) {
+            fclose(f);
+            return -1;
         }
+        im->src = ns;
         im->src[im->n_src] = strdup(expanded);
         if (!im->src[im->n_src]) {
             fclose(f);

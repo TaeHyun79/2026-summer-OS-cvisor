@@ -15,6 +15,17 @@
 enum { PANE_STACK = 0, PANE_HEAP, PANE_GLOBALS, PANE_RODATA, PANE_CODE,
        PANE_N };
 
+/* the one pane -> name mapping (status bar short name, panel title) */
+static const struct {
+    const char *short_name, *title;
+} PANE_INFO[PANE_N] = {
+    [PANE_STACK]   = { "stack",   "stack" },
+    [PANE_HEAP]    = { "heap",    "heap (brk+mmap)" },
+    [PANE_GLOBALS] = { "globals", "globals (.got/.data/.bss)" },
+    [PANE_RODATA]  = { "rodata",  "rodata (string literals, constants)" },
+    [PANE_CODE]    = { "code",    "code (.text machine bytes)" },
+};
+
 /* wide layout: 4x2 grid with every memory section visible at once.
  * Kicks in when the terminal is at least this big — roughly 2/3 of a
  * typical fullscreen terminal, and wide enough that each of the 4 columns
@@ -32,21 +43,8 @@ enum {
     CP_VAR,       /* variable names/values (libdw) */
 };
 
-typedef struct {
-    trace_t *t;
-    int      proc;                  /* current process (proc index) */
-    size_t   cur;                   /* step index within that process */
-    int      mode_src;              /* 0 = instruction step, 1 = source step */
-    int      mem_pane;
-    int      mem_scroll[PANE_N];    /* row offset per memory pane */
-    int      stack_desc;            /* 1 = high addresses on top (CSAPP) */
-    int      show_out;
-    int      show_sys;              /* syscall log overlay */
-    int      show_vars;             /* variables overlay (libdw) */
-    int      wide;                  /* 4x2 layout: all memory panes shown */
-    WINDOW  *wsrc, *wasm, *wreg, *wmem, *wout, *wsys, *wvar;
-    WINDOW  *wmems[PANE_N];         /* wide mode: one window per section */
-} ui_t;
+/* at most one overlay (bottom half of the screen) is open at a time */
+enum { OV_NONE = 0, OV_OUT, OV_SYS, OV_VARS };
 
 /* one resolvable variable of the current step: local/param of the function
  * at RIP, or an image global — with its value snapshot-decoded */
@@ -58,6 +56,24 @@ typedef struct {
     int           changed;
 } varview_t;
 #define MAX_VARVIEW 64
+
+typedef struct {
+    trace_t *t;
+    int      proc;                  /* current process (proc index) */
+    size_t   cur;                   /* step index within that process */
+    int      mode_src;              /* 0 = instruction step, 1 = source step */
+    int      mem_pane;
+    int      mem_scroll[PANE_N];    /* row offset per memory pane */
+    int      stack_desc;            /* 1 = high addresses on top (CSAPP) */
+    int      overlay;               /* OV_* */
+    int      wide;                  /* 4x2 layout: all memory panes shown */
+    WINDOW  *wsrc, *wasm, *wreg, *wmem, *wovl;
+    WINDOW  *wmems[PANE_N];         /* wide mode: one window per section */
+    /* variable views of the current step, built once per redraw */
+    varview_t      vvs[MAX_VARVIEW];
+    int            n_vvs;
+    const dfunc_t *vv_func;
+} ui_t;
 
 /* ---------------- helpers ---------------- */
 
@@ -75,114 +91,7 @@ static const image_t *cur_img(ui_t *u)
     return u->t->images[cur_step(u)->img];
 }
 
-/* fetch the byte at absolute address `addr` from a step's snapshots */
-static int step_byte(const trace_t *t, const step_t *s, uint64_t addr,
-                     uint8_t *out)
-{
-    if (s->stack && addr >= s->stack_base &&
-        addr < s->stack_base + s->stack_len) {
-        *out = s->stack[addr - s->stack_base];
-        return 0;
-    }
-    for (int i = 0; i < s->n_heapr; i++) {
-        const heapreg_t *hr = &s->heapr[i];
-        if (hr->buf && addr >= hr->base && addr < hr->base + hr->len) {
-            *out = hr->buf[addr - hr->base];
-            return 0;
-        }
-    }
-    const image_t *im = t->images[s->img];
-    if (s->globals && addr >= im->globals_rng.start &&
-        addr < im->globals_rng.start + s->globals_len) {
-        *out = s->globals[addr - im->globals_rng.start];
-        return 0;
-    }
-    return -1;
-}
-
 /* ---------------- variable views (libdw) ---------------- */
-
-/* little-endian read of 1..8 bytes from a step's snapshots */
-static int step_read(const trace_t *t, const step_t *s, uint64_t addr,
-                     uint32_t size, uint64_t *out)
-{
-    if (size == 0 || size > 8)
-        return -1;
-    uint64_t v = 0;
-    for (uint32_t i = 0; i < size; i++) {
-        uint8_t b;
-        if (step_byte(t, s, addr + i, &b) < 0)
-            return -1;
-        v |= (uint64_t)b << (8 * i);
-    }
-    *out = v;
-    return 0;
-}
-
-/* DW_ATE_* values (hardcoded so tui.c needs no dwarf.h) */
-#define ATE_BOOL   2
-#define ATE_FLOAT  4
-#define ATE_SIGNED 5
-#define ATE_SCHAR  6
-#define ATE_UNSIG  7
-#define ATE_UCHAR  8
-
-static void fmt_val(const dvar_t *v, uint64_t raw, char *buf, size_t n)
-{
-    if (v->is_ptr) {
-        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
-        return;
-    }
-    switch (v->enc) {
-    case ATE_FLOAT:
-        if (v->size == 4) {
-            float f;
-            uint32_t r32 = (uint32_t)raw;
-            memcpy(&f, &r32, 4);
-            snprintf(buf, n, "%g", (double)f);
-        } else {
-            double d;
-            memcpy(&d, &raw, 8);
-            snprintf(buf, n, "%g", d);
-        }
-        return;
-    case ATE_SIGNED: case ATE_SCHAR: {
-        int64_t sv = (int64_t)raw;
-        if (v->size < 8) { /* sign-extend */
-            uint64_t m = 1ull << (8 * v->size - 1);
-            sv = (int64_t)((raw ^ m) - m);
-        }
-        if (v->enc == ATE_SCHAR && sv >= 0x20 && sv < 0x7f)
-            snprintf(buf, n, "'%c' (%lld)", (char)sv, (long long)sv);
-        else if (sv >= 4096 || sv <= -4096)
-            snprintf(buf, n, "%lld (0x%llx)", (long long)sv,
-                     (unsigned long long)raw);
-        else
-            snprintf(buf, n, "%lld", (long long)sv);
-        return;
-    }
-    case ATE_BOOL:
-        snprintf(buf, n, "%s", raw ? "true" : "false");
-        return;
-    case ATE_UCHAR:
-        if (raw >= 0x20 && raw < 0x7f) {
-            snprintf(buf, n, "'%c' (%llu)", (char)raw,
-                     (unsigned long long)raw);
-            return;
-        }
-        /* fall through */
-    case ATE_UNSIG:
-        if (raw >= 4096)
-            snprintf(buf, n, "%llu (0x%llx)", (unsigned long long)raw,
-                     (unsigned long long)raw);
-        else
-            snprintf(buf, n, "%llu", (unsigned long long)raw);
-        return;
-    default:
-        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
-        return;
-    }
-}
 
 static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
                          varview_t *vv)
@@ -196,9 +105,8 @@ static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
     uint64_t raw, praw;
     if (step_read(t, s, vv->addr, v->size, &raw) == 0) {
         vv->has_val = 1;
-        fmt_val(v, raw, vv->val, sizeof(vv->val));
-        uint64_t paddr = v->is_global ? v->addr
-                                      : dvar_addr(f, v, p->regs.rbp);
+        dvar_fmt_val(v, raw, vv->val, sizeof(vv->val));
+        uint64_t paddr = dvar_addr(f, v, p->regs.rbp);
         vv->changed = (u->cur > 0 &&
                        (step_read(t, p, paddr, v->size, &praw) < 0 ||
                         praw != raw));
@@ -207,21 +115,20 @@ static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
     }
 }
 
-/* locals/params of the function at RIP first, then image globals */
-static int build_varviews(ui_t *u, varview_t *out, int max,
-                          const dfunc_t **fout)
+/* rebuild u->vvs for the current step: locals/params of the function at
+ * RIP first, then image globals — called once per redraw */
+static void refresh_varviews(ui_t *u)
 {
     const image_t *im = cur_img(u);
     const dfunc_t *f = img_func_at(im, cur_step(u)->regs.rip);
     int n = 0;
     if (f)
-        for (int i = 0; i < f->n_vars && n < max; i++)
-            fill_varview(u, f, &f->vars[i], &out[n++]);
-    for (int i = 0; i < im->n_gvars && n < max; i++)
-        fill_varview(u, f, &im->gvars[i], &out[n++]);
-    if (fout)
-        *fout = f;
-    return n;
+        for (int i = 0; i < f->n_vars && n < MAX_VARVIEW; i++)
+            fill_varview(u, f, &f->vars[i], &u->vvs[n++]);
+    for (int i = 0; i < im->n_gvars && n < MAX_VARVIEW; i++)
+        fill_varview(u, f, &im->gvars[i], &u->vvs[n++]);
+    u->n_vvs = n;
+    u->vv_func = f;
 }
 
 static void draw_frame_f(WINDOW *w, const char *title, int focus)
@@ -252,6 +159,14 @@ static int center_first(int pos, int total, int visible)
     if (first > total - visible)
         first = total - visible;
     return first;
+}
+
+/* pad the current-row highlight to the panel edge and drop the attr */
+static void hl_row_end(WINDOW *w, int y, int width)
+{
+    for (int x = getcurx(w); x < width + 1; x++)
+        mvwaddch(w, y, x, ' ');
+    wattroff(w, COLOR_PAIR(CP_CUR) | A_BOLD);
 }
 
 /* ---------------- source panel ---------------- */
@@ -285,13 +200,8 @@ static void draw_src(ui_t *u)
         mvwprintw(u->wsrc, 1 + i, 1, "%c%4d  %-.*s",
                   is_cur ? '>' : ' ', lineno,
                   w > 7 ? w - 7 : 0, im->src[first + i]);
-        if (is_cur) {
-            /* pad highlight to panel edge */
-            int x = getcurx(u->wsrc);
-            for (; x < w + 1; x++)
-                mvwaddch(u->wsrc, 1 + i, x, ' ');
-            wattroff(u->wsrc, COLOR_PAIR(CP_CUR) | A_BOLD);
-        }
+        if (is_cur)
+            hl_row_end(u->wsrc, 1 + i, w);
     }
     wnoutrefresh(u->wsrc);
 }
@@ -321,12 +231,8 @@ static void draw_asm(ui_t *u)
                       is_cur ? '>' : ' ',
                       (unsigned long long)d->addr,
                       w > 10 ? w - 10 : 0, d->text);
-        if (is_cur) {
-            int x = getcurx(u->wasm);
-            for (; x < w + 1; x++)
-                mvwaddch(u->wasm, 1 + i, x, ' ');
-            wattroff(u->wasm, COLOR_PAIR(CP_CUR) | A_BOLD);
-        }
+        if (is_cur)
+            hl_row_end(u->wasm, 1 + i, w);
     }
     wnoutrefresh(u->wasm);
 }
@@ -358,8 +264,7 @@ static void draw_reg(ui_t *u)
         if (col >= ncols)
             break;
         uint64_t v = cv_reg(&s->regs, i), pv = cv_reg(&p->regs, i);
-        int changed = (u->cur > 0 && v != pv &&
-                       strcmp(CV_REGS[i].name, "RIP") != 0);
+        int changed = (u->cur > 0 && v != pv && i != CV_REG_RIP);
         int x = 1 + col * cell;
         mvwprintw(u->wreg, 1 + row, x, "%s ", CV_REGS[i].name);
         if (changed)
@@ -397,27 +302,25 @@ static void mem_region(ui_t *u, int pane, uint64_t *base, size_t *len,
 {
     const step_t *s = cur_step(u);
     const image_t *im = cur_img(u);
+    *name = PANE_INFO[pane].title;
     switch (pane) {
     case PANE_STACK:
         *base = s->stack_base; *len = s->stack_len; *buf = s->stack;
-        *name = "stack";
         break;
     case PANE_RODATA: /* read-only: loaded once from the ELF, never changes */
         *base = im->rodata_rng.start;
         *len  = im->rodata_bytes ? im->rodata_rng.end - im->rodata_rng.start
                                  : 0;
         *buf  = im->rodata_bytes;
-        *name = "rodata (string literals, constants)";
         break;
     case PANE_CODE:
         *base = im->text.start;
         *len  = im->text_bytes ? im->text.end - im->text.start : 0;
         *buf  = im->text_bytes;
-        *name = "code (.text machine bytes)";
         break;
     default:
         *base = im->globals_rng.start; *len = s->globals_len;
-        *buf = s->globals; *name = "globals (.got/.data/.bss)";
+        *buf = s->globals;
         break;
     }
 }
@@ -465,8 +368,10 @@ static void draw_hex_row(ui_t *u, WINDOW *w, int y, uint64_t row_addr,
 static void draw_mem_heap(ui_t *u, WINDOW *w, int focus)
 {
     const step_t *s = cur_step(u);
-    draw_frame_f(w, u->wide ? "heap (brk+mmap)"
-                            : "heap (brk+mmap)  (Tab: next pane)", focus);
+    char title[80];
+    snprintf(title, sizeof(title), "%s%s", PANE_INFO[PANE_HEAP].title,
+             u->wide ? "" : "  (Tab: next pane)");
+    draw_frame_f(w, title, focus);
     int h = getmaxy(w) - 2;
     if (h <= 0)
         return;
@@ -540,11 +445,9 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
     uint64_t hi = (base + len + 7) & ~(uint64_t)7;
     int nrows = (int)((hi - lo) / 8);
 
-    /* variable annotations for stack/globals rows (libdw) */
-    varview_t vvs[MAX_VARVIEW];
-    int n_vv = 0;
-    if (pane == PANE_STACK || pane == PANE_GLOBALS)
-        n_vv = build_varviews(u, vvs, MAX_VARVIEW, NULL);
+    /* variable annotations for stack/globals rows (libdw); u->vvs is
+     * refreshed once per redraw */
+    int n_vv = (pane == PANE_STACK || pane == PANE_GLOBALS) ? u->n_vvs : 0;
 
     /* centering anchor: RSP row for the stack, RIP row for code */
     int anchor = 0;
@@ -593,7 +496,7 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
 
         /* inline variable annotations: names whose address is in this row */
         for (int k = 0; k < n_vv; k++) {
-            const varview_t *vv = &vvs[k];
+            const varview_t *vv = &u->vvs[k];
             if (vv->addr < row_addr || vv->addr >= row_addr + 8)
                 continue;
             if (pane == PANE_GLOBALS && !vv->v->is_global)
@@ -626,193 +529,155 @@ static size_t output_len_at(const trace_t *t, uint64_t gseq)
 
 static void draw_out(ui_t *u)
 {
-    if (!u->wout)
-        return;
-    draw_frame(u->wout, "program output (o: close)");
-    int h = getmaxy(u->wout) - 2, w = getmaxx(u->wout) - 2;
+    WINDOW *w = u->wovl;
+    draw_frame(w, "program output (o: close)");
+    int h = getmaxy(w) - 2, width = getmaxx(w) - 2;
     if (h <= 0)
         return;
 
     size_t len = output_len_at(u->t, cur_step(u)->gseq);
     const char *out = u->t->prog_output;
-
-    /* split into lines, keep only the last h */
-    const char *lines[512];
-    int nlines = 0;
-    const char *pstart = out;
-    for (size_t i = 0; i < len; i++) {
-        if (out[i] == '\n') {
-            if (nlines < 512)
-                lines[nlines++] = pstart;
-            else {
-                memmove((void *)lines, (void *)(lines + 1),
-                        511 * sizeof(char *));
-                lines[511] = pstart;
-            }
-            pstart = out + i + 1;
-        }
+    if (len == 0) {
+        mvwprintw(w, 1, 2, "(no output up to this step)");
+        wnoutrefresh(w);
+        return;
     }
-    int partial = (pstart < out + len);
-    int total = nlines + partial;
-    int first = total > h ? total - h : 0;
 
-    for (int i = first; i < total; i++) {
-        const char *ls;
-        size_t ll;
-        if (i < nlines) {
-            ls = lines[i];
-            const char *e = memchr(ls, '\n', len - (size_t)(ls - out));
-            ll = e ? (size_t)(e - ls) : len - (size_t)(ls - out);
-        } else {
-            ls = pstart;
-            ll = len - (size_t)(pstart - out);
-        }
-        if (ll > (size_t)w)
-            ll = (size_t)w;
-        mvwprintw(u->wout, 1 + (i - first), 1, "%.*s", (int)ll, ls);
+    /* find the start of the last h lines by scanning backward: skip a
+     * trailing newline, then step back one newline per displayed line */
+    size_t start = len;
+    int want = h + (out[len - 1] == '\n' ? 1 : 0);
+    while (start > 0 && want > 0) {
+        start--;
+        if (out[start] == '\n')
+            want--;
     }
-    if (len == 0)
-        mvwprintw(u->wout, 1, 2, "(no output up to this step)");
-    wnoutrefresh(u->wout);
+    if (start > 0)
+        start++; /* stopped ON a newline: the tail begins after it */
+
+    for (int row = 0; row < h && start < len; row++) {
+        const char *ls = out + start;
+        const char *e = memchr(ls, '\n', len - start);
+        size_t ll = e ? (size_t)(e - ls) : len - start;
+        mvwprintw(w, 1 + row, 1, "%.*s",
+                  (int)(ll > (size_t)width ? (size_t)width : ll), ls);
+        start += ll + 1;
+    }
+    wnoutrefresh(w);
 }
 
 /* ---------------- syscall log overlay ---------------- */
 
 static void draw_sys(ui_t *u)
 {
-    if (!u->wsys)
-        return;
-    draw_frame(u->wsys, "syscalls up to this step (s: close)");
-    int h = getmaxy(u->wsys) - 2, w = getmaxx(u->wsys) - 2;
+    WINDOW *w = u->wovl;
+    draw_frame(w, "syscalls up to this step (s: close)");
+    int h = getmaxy(w) - 2, width = getmaxx(w) - 2;
     if (h <= 0)
         return;
 
     const trace_t *t = u->t;
-    /* this process's events with step <= cur; show the last h of them */
-    size_t match = 0;
-    for (size_t i = 0; i < t->n_scs; i++)
+    /* single backward pass: collect the last h matching events (this
+     * process, step <= cur), then print them oldest-first */
+    size_t idx[64]; /* h is bounded by the overlay height */
+    int n = 0;
+    int max = h < (int)(sizeof(idx) / sizeof(idx[0]))
+                  ? h : (int)(sizeof(idx) / sizeof(idx[0]));
+    for (size_t i = t->n_scs; i-- > 0 && n < max; ) {
         if (t->scs[i].proc == u->proc && t->scs[i].step <= u->cur)
-            match++;
-    size_t skip = match > (size_t)h ? match - (size_t)h : 0;
+            idx[n++] = i;
+    }
+    if (n == 0)
+        mvwprintw(w, 1, 2, "(no syscalls up to this step)");
 
-    if (match == 0)
-        mvwprintw(u->wsys, 1, 2, "(no syscalls up to this step)");
-    int row = 0;
-    for (size_t i = 0; i < t->n_scs; i++) {
-        const scevent_t *e = &t->scs[i];
-        if (e->proc != u->proc || e->step > u->cur)
-            continue;
-        if (skip) {
-            skip--;
-            continue;
-        }
-        const char *name = cv_syscall_name(e->nr);
-        char nbuf[24];
-        if (!name) {
-            snprintf(nbuf, sizeof(nbuf), "sys_%lld", (long long)e->nr);
-            name = nbuf;
-        }
-        char line[256];
-        snprintf(line, sizeof(line),
-                 "step %5zu  %s(0x%llx, 0x%llx, 0x%llx) = %lld",
-                 e->step, name,
-                 (unsigned long long)e->args[0],
-                 (unsigned long long)e->args[1],
-                 (unsigned long long)e->args[2], (long long)e->ret);
+    for (int row = 0; row < n; row++) {
+        const scevent_t *e = &t->scs[idx[n - 1 - row]];
+        char scbuf[128], line[160];
+        cv_format_syscall(e, scbuf, sizeof(scbuf));
+        snprintf(line, sizeof(line), "step %5zu  %s", e->step, scbuf);
         int is_cur = (e->step == u->cur);
         if (is_cur)
-            wattron(u->wsys, A_BOLD);
-        mvwprintw(u->wsys, 1 + row, 1, "%-.*s", w, line);
+            wattron(w, A_BOLD);
+        mvwprintw(w, 1 + row, 1, "%-.*s", width, line);
         if (is_cur)
-            wattroff(u->wsys, A_BOLD);
-        if (++row >= h)
-            break;
+            wattroff(w, A_BOLD);
     }
-    wnoutrefresh(u->wsys);
+    wnoutrefresh(w);
 }
 
 /* ---------------- variables overlay ---------------- */
 
 static void draw_vars(ui_t *u)
 {
-    if (!u->wvar)
-        return;
-    draw_frame(u->wvar, "variables (v: close)");
-    int h = getmaxy(u->wvar) - 2, w = getmaxx(u->wvar) - 2;
+    WINDOW *w = u->wovl;
+    draw_frame(w, "variables (v: close)");
+    int h = getmaxy(w) - 2, width = getmaxx(w) - 2;
     if (h <= 0)
         return;
 
-    varview_t vvs[MAX_VARVIEW];
-    const dfunc_t *f = NULL;
-    int n = build_varviews(u, vvs, MAX_VARVIEW, &f);
-
+    const dfunc_t *f = u->vv_func;
     int row = 0;
     if (f) {
-        wattron(u->wvar, A_BOLD);
-        mvwprintw(u->wvar, 1 + row++, 1, "fn %s  [0x%llx-0x%llx]",
+        wattron(w, A_BOLD);
+        mvwprintw(w, 1 + row++, 1, "fn %s  [0x%llx-0x%llx]",
                   f->name, (unsigned long long)f->lo,
                   (unsigned long long)f->hi);
-        wattroff(u->wvar, A_BOLD);
+        wattroff(w, A_BOLD);
     } else {
-        mvwprintw(u->wvar, 1 + row++, 1,
-                  "(no function info at this address)");
+        mvwprintw(w, 1 + row++, 1, "(no function info at this address)");
     }
 
     int shown_globals_hdr = 0;
-    for (int i = 0; i < n && row < h; i++) {
-        const varview_t *vv = &vvs[i];
+    for (int i = 0; i < u->n_vvs && row < h; i++) {
+        const varview_t *vv = &u->vvs[i];
         const dvar_t *v = vv->v;
         if (v->is_global && !shown_globals_hdr) {
-            if (row < h) {
-                wattron(u->wvar, A_BOLD);
-                mvwprintw(u->wvar, 1 + row++, 1, "globals:");
-                wattroff(u->wvar, A_BOLD);
-            }
+            wattron(w, A_BOLD);
+            mvwprintw(w, 1 + row++, 1, "globals:");
+            wattroff(w, A_BOLD);
             shown_globals_hdr = 1;
+            if (row >= h)
+                break;
         }
-        if (row >= h)
-            break;
 
         char loc[40];
         if (v->is_global) {
             snprintf(loc, sizeof(loc), "0x%llx",
                      (unsigned long long)v->addr);
+        } else if (vv->has_val) {
+            snprintf(loc, sizeof(loc), "rbp%+lld  (0x%llx)",
+                     (long long)dvar_rbp_off(f, v),
+                     (unsigned long long)vv->addr);
         } else {
-            /* static offset from RBP (CFA = RBP+16), stable even while
-             * the prologue has not set RBP up yet */
-            long long rbp_off = f ? (f->fb_cfa ? v->off + 16
-                                               : f->fb_off + v->off)
-                                  : v->off;
-            if (vv->has_val)
-                snprintf(loc, sizeof(loc), "rbp%+lld  (0x%llx)", rbp_off,
-                         (unsigned long long)vv->addr);
-            else
-                snprintf(loc, sizeof(loc), "rbp%+lld", rbp_off);
+            /* prologue: RBP not set up yet, only the static offset is
+             * meaningful */
+            snprintf(loc, sizeof(loc), "rbp%+lld",
+                     (long long)dvar_rbp_off(f, v));
         }
 
         int y = 1 + row++;
-        wattron(u->wvar, COLOR_PAIR(CP_VAR) | A_BOLD);
-        mvwprintw(u->wvar, y, 1, "  %-14.14s", v->name);
-        wattroff(u->wvar, COLOR_PAIR(CP_VAR) | A_BOLD);
-        wattron(u->wvar, A_DIM);
-        wprintw(u->wvar, " : %-12.12s%s", v->type,
+        wattron(w, COLOR_PAIR(CP_VAR) | A_BOLD);
+        mvwprintw(w, y, 1, "  %-14.14s", v->name);
+        wattroff(w, COLOR_PAIR(CP_VAR) | A_BOLD);
+        wattron(w, A_DIM);
+        wprintw(w, " : %-12.12s%s", v->type,
                 v->is_param ? " param " : "       ");
-        wattroff(u->wvar, A_DIM);
-        wprintw(u->wvar, "= ");
+        wattroff(w, A_DIM);
+        wprintw(w, "= ");
         int vattr = vv->changed ? (COLOR_PAIR(CP_CHG) | A_BOLD)
                                 : COLOR_PAIR(CP_VAR);
-        wattron(u->wvar, vattr);
-        wprintw(u->wvar, "%-22.22s",
+        wattron(w, vattr);
+        wprintw(w, "%-22.22s",
                 vv->has_val ? vv->val : (v->size ? "?" : "<agg>"));
-        wattroff(u->wvar, vattr);
-        wattron(u->wvar, A_DIM);
-        wprintw(u->wvar, " @ %-.*s", w - getcurx(u->wvar) - 1, loc);
-        wattroff(u->wvar, A_DIM);
+        wattroff(w, vattr);
+        wattron(w, A_DIM);
+        wprintw(w, " @ %-.*s", width - getcurx(w) - 1, loc);
+        wattroff(w, A_DIM);
     }
-    if (n == 0 && row < h)
-        mvwprintw(u->wvar, 1 + row, 1,
+    if (u->n_vvs == 0 && row < h)
+        mvwprintw(w, 1 + row, 1,
                   "(no variables — was the target built with -g?)");
-    wnoutrefresh(u->wvar);
+    wnoutrefresh(w);
 }
 
 /* ---------------- status bar ---------------- */
@@ -839,10 +704,7 @@ static void draw_status(ui_t *u)
              " step %zu/%zu%s%s | mode: %s | mem: %s%s",
              u->cur, p->n_steps - 1, skipbuf, procbuf,
              u->mode_src ? "SRC " : "INSN",
-             u->mem_pane == PANE_STACK ? "stack" :
-             u->mem_pane == PANE_HEAP ? "heap" :
-             u->mem_pane == PANE_GLOBALS ? "globals" :
-             u->mem_pane == PANE_RODATA ? "rodata" : "code",
+             PANE_INFO[u->mem_pane].short_name,
              t->truncated ? " | TRUNCATED" : "");
     mvprintw(LINES - 1, 0, "%-.*s", COLS, left);
 
@@ -882,11 +744,8 @@ static void destroy_windows(ui_t *u)
     if (u->wasm) delwin(u->wasm);
     if (u->wreg) delwin(u->wreg);
     if (u->wmem) delwin(u->wmem);
-    if (u->wout) delwin(u->wout);
-    if (u->wsys) delwin(u->wsys);
-    if (u->wvar) delwin(u->wvar);
-    u->wsrc = u->wasm = u->wreg = u->wmem = u->wout = u->wsys = NULL;
-    u->wvar = NULL;
+    if (u->wovl) delwin(u->wovl);
+    u->wsrc = u->wasm = u->wreg = u->wmem = u->wovl = NULL;
     for (int i = 0; i < PANE_N; i++) {
         if (u->wmems[i])
             delwin(u->wmems[i]);
@@ -924,22 +783,15 @@ static void make_windows(ui_t *u)
         u->wreg = newwin(bot_h, left_w, top_h, 0);
         u->wmem = newwin(bot_h, COLS - left_w, top_h, left_w);
     }
-    if (u->show_out) {
+    if (u->overlay != OV_NONE) {
         int oh = usable / 2;
-        u->wout = newwin(oh, COLS, usable - oh, 0);
-    }
-    if (u->show_sys) {
-        int oh = usable / 2;
-        u->wsys = newwin(oh, COLS, usable - oh, 0);
-    }
-    if (u->show_vars) {
-        int oh = usable / 2;
-        u->wvar = newwin(oh, COLS, usable - oh, 0);
+        u->wovl = newwin(oh, COLS, usable - oh, 0);
     }
 }
 
 static void redraw(ui_t *u)
 {
+    refresh_varviews(u); /* shared by mem-pane annotations and 'v' */
     erase();
     wnoutrefresh(stdscr);
     draw_src(u);
@@ -951,12 +803,11 @@ static void redraw(ui_t *u)
     } else {
         draw_mem_one(u, u->wmem, u->mem_pane, 0);
     }
-    if (u->show_out)
-        draw_out(u);
-    if (u->show_sys)
-        draw_sys(u);
-    if (u->show_vars)
-        draw_vars(u);
+    switch (u->overlay) {
+    case OV_OUT:  draw_out(u);  break;
+    case OV_SYS:  draw_sys(u);  break;
+    case OV_VARS: draw_vars(u); break;
+    }
     draw_status(u);
     doupdate();
 }
@@ -1136,21 +987,15 @@ int tui_run(trace_t *t)
             switch_proc(&u);
             break;
         case 'o':
-            u.show_out = !u.show_out;
-            u.show_sys = 0;
-            u.show_vars = 0;
+            u.overlay = (u.overlay == OV_OUT) ? OV_NONE : OV_OUT;
             make_windows(&u);
             break;
         case 's':
-            u.show_sys = !u.show_sys;
-            u.show_out = 0;
-            u.show_vars = 0;
+            u.overlay = (u.overlay == OV_SYS) ? OV_NONE : OV_SYS;
             make_windows(&u);
             break;
         case 'v':
-            u.show_vars = !u.show_vars;
-            u.show_out = 0;
-            u.show_sys = 0;
+            u.overlay = (u.overlay == OV_VARS) ? OV_NONE : OV_VARS;
             make_windows(&u);
             break;
         case 'f':

@@ -172,9 +172,15 @@ typedef struct {
 
 extern const regdesc_t CV_REGS[];
 extern const int       CV_NREGS;
+#define CV_REG_RIP 0 /* CV_REGS[] keeps RIP first; consumers rely on this */
 
 uint64_t    cv_reg(const struct user_regs_struct *r, int i);
 const char *cv_syscall_name(int64_t nr); /* NULL if unknown */
+void        cv_format_syscall(const scevent_t *e, char *buf, size_t n);
+
+/* grow-by-doubling helper for dynamic arrays: returns the (re)allocated
+ * array and updates *cap, or NULL leaving the old array intact */
+void *cv_grow(void *arr, size_t n, size_t *cap, size_t elem, size_t init);
 
 /* ---------- analyzer.c ---------- */
 
@@ -188,6 +194,11 @@ int            dw_load_vars(image_t *img, const char *path); /* soft-fail */
 const dfunc_t *img_func_at(const image_t *img, uint64_t rip);
 /* frame-relative var -> absolute address given the function's frame base */
 uint64_t       dvar_addr(const dfunc_t *f, const dvar_t *v, uint64_t rbp);
+/* static RBP-relative offset of a frame variable (no runtime rbp needed) */
+int64_t        dvar_rbp_off(const dfunc_t *f, const dvar_t *v);
+/* render a raw little-endian value according to the variable's type */
+void           dvar_fmt_val(const dvar_t *v, uint64_t raw, char *buf,
+                            size_t n);
 
 /* ---------- recorder.c ---------- */
 
@@ -202,6 +213,12 @@ int32_t img_line_lookup(const image_t *img, uint64_t rip);
 step_t *proc_new_step(proc_t *p);            /* NULL on OOM */
 void    trace_append_output(trace_t *t, const char *buf, size_t len);
 void    trace_free(trace_t *t);
+
+/* reconstruct memory from a step's snapshots (stack/heap/globals) */
+int step_byte(const trace_t *t, const step_t *s, uint64_t addr,
+              uint8_t *out);
+int step_read(const trace_t *t, const step_t *s, uint64_t addr,
+              uint32_t size, uint64_t *out); /* little-endian, 1..8 bytes */
 
 /* ---------- tui.c ---------- */
 

@@ -2,11 +2,25 @@
 #define _GNU_SOURCE
 #include "cvisor.h"
 
+#include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stddef.h>
 
-/* register display order: pointers first, then GPRs, then eflags */
+void *cv_grow(void *arr, size_t n, size_t *cap, size_t elem, size_t init)
+{
+    if (n < *cap)
+        return arr;
+    size_t ncap = *cap ? *cap * 2 : init;
+    void *na = realloc(arr, ncap * elem);
+    if (!na)
+        return NULL;
+    *cap = ncap;
+    return na;
+}
+
+/* register display order: RIP first (CV_REG_RIP relies on this), then
+ * the other pointers, GPRs, and eflags */
 const regdesc_t CV_REGS[] = {
     { "RIP", offsetof(struct user_regs_struct, rip) },
     { "RSP", offsetof(struct user_regs_struct, rsp) },
@@ -60,6 +74,62 @@ const char *cv_syscall_name(int64_t nr)
     return NULL;
 }
 
+/* the one display convention for a syscall event (dump and TUI overlay) */
+void cv_format_syscall(const scevent_t *e, char *buf, size_t n)
+{
+    char nbuf[24];
+    const char *name = cv_syscall_name(e->nr);
+    if (!name) {
+        snprintf(nbuf, sizeof(nbuf), "sys_%lld", (long long)e->nr);
+        name = nbuf;
+    }
+    snprintf(buf, n, "%s(0x%llx, 0x%llx, 0x%llx) = %lld", name,
+             (unsigned long long)e->args[0],
+             (unsigned long long)e->args[1],
+             (unsigned long long)e->args[2], (long long)e->ret);
+}
+
+/* fetch the byte at absolute address `addr` from a step's snapshots */
+int step_byte(const trace_t *t, const step_t *s, uint64_t addr, uint8_t *out)
+{
+    if (s->stack && addr >= s->stack_base &&
+        addr < s->stack_base + s->stack_len) {
+        *out = s->stack[addr - s->stack_base];
+        return 0;
+    }
+    for (int i = 0; i < s->n_heapr; i++) {
+        const heapreg_t *hr = &s->heapr[i];
+        if (hr->buf && addr >= hr->base && addr < hr->base + hr->len) {
+            *out = hr->buf[addr - hr->base];
+            return 0;
+        }
+    }
+    const image_t *im = t->images[s->img];
+    if (s->globals && addr >= im->globals_rng.start &&
+        addr < im->globals_rng.start + s->globals_len) {
+        *out = s->globals[addr - im->globals_rng.start];
+        return 0;
+    }
+    return -1;
+}
+
+/* little-endian read of 1..8 bytes from a step's snapshots */
+int step_read(const trace_t *t, const step_t *s, uint64_t addr,
+              uint32_t size, uint64_t *out)
+{
+    if (size == 0 || size > 8)
+        return -1;
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        uint8_t b;
+        if (step_byte(t, s, addr + i, &b) < 0)
+            return -1;
+        v |= (uint64_t)b << (8 * i);
+    }
+    *out = v;
+    return 0;
+}
+
 /* exact binary search over irefs (rip is always an instruction boundary) */
 int32_t img_insn_lookup(const image_t *im, uint64_t rip)
 {
@@ -96,14 +166,11 @@ int32_t img_line_lookup(const image_t *im, uint64_t rip)
 
 step_t *proc_new_step(proc_t *p)
 {
-    if (p->n_steps == p->cap_steps) {
-        size_t ncap = p->cap_steps ? p->cap_steps * 2 : 1024;
-        step_t *ns = realloc(p->steps, ncap * sizeof(step_t));
-        if (!ns)
-            return NULL;
-        p->steps = ns;
-        p->cap_steps = ncap;
-    }
+    step_t *ns = cv_grow(p->steps, p->n_steps, &p->cap_steps,
+                         sizeof(step_t), 1024);
+    if (!ns)
+        return NULL;
+    p->steps = ns;
     step_t *s = &p->steps[p->n_steps++];
     memset(s, 0, sizeof(*s));
     s->src_line = -1;

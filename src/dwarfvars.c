@@ -294,11 +294,75 @@ const dfunc_t *img_func_at(const image_t *im, uint64_t rip)
     return (rip < f->hi) ? f : NULL;
 }
 
+/* static offset from RBP; frame-base convention lives only here */
+int64_t dvar_rbp_off(const dfunc_t *f, const dvar_t *v)
+{
+    if (!f)
+        return v->off;
+    /* CFA = RBP + 16 once "push %rbp; mov %rsp,%rbp" has run */
+    return (f->fb_cfa ? 16 : f->fb_off) + v->off;
+}
+
 uint64_t dvar_addr(const dfunc_t *f, const dvar_t *v, uint64_t rbp)
 {
     if (v->is_global)
         return v->addr;
-    /* CFA = RBP + 16 once "push %rbp; mov %rsp,%rbp" has run */
-    uint64_t base = f->fb_cfa ? rbp + 16 : rbp + (uint64_t)f->fb_off;
-    return base + (uint64_t)v->off;
+    return rbp + (uint64_t)dvar_rbp_off(f, v);
+}
+
+void dvar_fmt_val(const dvar_t *v, uint64_t raw, char *buf, size_t n)
+{
+    if (v->is_ptr) {
+        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
+        return;
+    }
+    switch (v->enc) {
+    case DW_ATE_float:
+        if (v->size == 4) {
+            float f;
+            uint32_t r32 = (uint32_t)raw;
+            memcpy(&f, &r32, 4);
+            snprintf(buf, n, "%g", (double)f);
+        } else {
+            double d;
+            memcpy(&d, &raw, 8);
+            snprintf(buf, n, "%g", d);
+        }
+        return;
+    case DW_ATE_signed: case DW_ATE_signed_char: {
+        int64_t sv = (int64_t)raw;
+        if (v->size < 8) { /* sign-extend */
+            uint64_t m = 1ull << (8 * v->size - 1);
+            sv = (int64_t)((raw ^ m) - m);
+        }
+        if (v->enc == DW_ATE_signed_char && sv >= 0x20 && sv < 0x7f)
+            snprintf(buf, n, "'%c' (%lld)", (char)sv, (long long)sv);
+        else if (sv >= 4096 || sv <= -4096)
+            snprintf(buf, n, "%lld (0x%llx)", (long long)sv,
+                     (unsigned long long)raw);
+        else
+            snprintf(buf, n, "%lld", (long long)sv);
+        return;
+    }
+    case DW_ATE_boolean:
+        snprintf(buf, n, "%s", raw ? "true" : "false");
+        return;
+    case DW_ATE_unsigned_char:
+        if (raw >= 0x20 && raw < 0x7f) {
+            snprintf(buf, n, "'%c' (%llu)", (char)raw,
+                     (unsigned long long)raw);
+            return;
+        }
+        /* fall through */
+    case DW_ATE_unsigned:
+        if (raw >= 4096)
+            snprintf(buf, n, "%llu (0x%llx)", (unsigned long long)raw,
+                     (unsigned long long)raw);
+        else
+            snprintf(buf, n, "%llu", (unsigned long long)raw);
+        return;
+    default:
+        snprintf(buf, n, "0x%llx", (unsigned long long)raw);
+        return;
+    }
 }
