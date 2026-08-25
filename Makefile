@@ -11,6 +11,21 @@ TESTCFLAGS := -g -O0 -no-pie -fno-omit-frame-pointer
 TESTSRCS   := $(wildcard tests/*.c)
 TESTBINS   := $(TESTSRCS:.c=)
 
+# libc-free assembly targets: entry is _start, syscalls are written by hand.
+# `as -g` is what emits the DWARF line table cvisor requires (spec §6.1) —
+# without it analyze() bails out.  ld's default output is already ET_EXEC,
+# so there is no -no-pie equivalent to pass here.
+AS         ?= as
+LD         ?= ld
+ASFLAGS    ?= -g
+TESTASMSRCS := $(wildcard tests/*.s)
+TESTASMBINS := $(TESTASMSRCS:.s=)
+
+# ch6 measurement homework: -O2 for real numbers, *_cv for viewing in cvisor
+CH6SRCS := $(wildcard ch6/*.c)
+CH6BINS := $(CH6SRCS:.c=)
+CH6CV   := $(CH6SRCS:.c=_cv)
+
 all: cvisor
 
 cvisor: $(OBJS)
@@ -19,10 +34,25 @@ cvisor: $(OBJS)
 src/%.o: src/%.c src/cvisor.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-tests: $(TESTBINS)
+tests: $(TESTBINS) $(TESTASMBINS)
 
 tests/%: tests/%.c
 	$(CC) $(TESTCFLAGS) -o $@ $<
+
+# the source file must end up next to the binary: analyzer.c open_source()
+# looks for the CU path, then basename(CU) beside the target, then in cwd
+tests/%: tests/%.s
+	$(AS) $(ASFLAGS) -o $@.o $<
+	$(LD) -o $@ $@.o
+	rm -f $@.o
+
+ch6: $(CH6BINS) $(CH6CV)
+
+ch6/%_cv: ch6/%.c
+	$(CC) $(TESTCFLAGS) -Wall -Wextra -o $@ $<
+
+ch6/%: ch6/%.c
+	$(CC) -O2 -Wall -Wextra -o $@ $<
 
 check: cvisor tests
 	./cvisor --dump tests/factorial > /dev/null && echo "dump: OK"
@@ -31,6 +61,7 @@ check: cvisor tests
 	./cvisor --trace --from-main tests/crash | tail -3
 
 clean:
-	rm -f cvisor $(OBJS) $(TESTBINS)
+	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) $(CH6BINS) $(CH6CV)
+	rm -f $(addsuffix .o,$(TESTASMBINS))
 
-.PHONY: all tests check clean
+.PHONY: all tests ch6 check clean

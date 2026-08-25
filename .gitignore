@@ -3,6 +3,7 @@ cvisor
 src/*.o
 tests/*
 !tests/*.c
+!tests/*.s
 ch6/*
 !ch6/*.c
 
