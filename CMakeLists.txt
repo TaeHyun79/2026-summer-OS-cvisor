@@ -24,4 +24,4 @@ endif()
 
 # separate target so CLion indexes the example program (it has its own
 # main(), so it must NOT be compiled into the cvisor binary above)
-add_executable(ch4_test ch4/test.c)
+add_executable(ch5_p1 ch5/p1.c)

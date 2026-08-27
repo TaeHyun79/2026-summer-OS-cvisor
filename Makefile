@@ -22,11 +22,11 @@ ASFLAGS    ?= -g
 TESTASMSRCS := $(wildcard tests/*.s)
 TESTASMBINS := $(TESTASMSRCS:.s=)
 
-# ch4 example programs: cvisor-observation builds only
-CH4SRCS := $(wildcard ch4/*.c)
-CH4BINS := $(CH4SRCS:.c=)
-CH4ASMSRCS := $(wildcard ch4/*.s)
-CH4ASMBINS := $(CH4ASMSRCS:.s=)
+# ch5 example programs: cvisor-observation builds only
+CH5SRCS := $(wildcard ch5/*.c)
+CH5BINS := $(CH5SRCS:.c=)
+CH5ASMSRCS := $(wildcard ch5/*.s)
+CH5ASMBINS := $(CH5ASMSRCS:.s=)
 
 # ch6 measurement homework: -O2 for real numbers, *_cv for viewing in cvisor
 CH6SRCS := $(wildcard ch6/*.c)
@@ -58,12 +58,12 @@ tests/%: tests/%.s
 	$(LD) -o $@ $@.o
 	rm -f $@.o
 
-ch4: $(CH4BINS) $(CH4ASMBINS)
+ch5: $(CH5BINS) $(CH5ASMBINS)
 
-ch4/%: ch4/%.c
+ch5/%: ch5/%.c
 	$(CC) $(TESTCFLAGS) -Wall -Wextra -o $@ $<
 
-ch4/%: ch4/%.s
+ch5/%: ch5/%.s
 	$(AS) $(ASFLAGS) -o $@.o $<
 	$(LD) -o $@ $@.o
 	rm -f $@.o
@@ -88,7 +88,7 @@ check: cvisor tests
 
 clean:
 	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) \
-	      $(CH4BINS) $(CH4ASMBINS) $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
-	rm -f $(addsuffix .o,$(TESTASMBINS) $(CH4ASMBINS) $(CH6ASMBINS))
+	      $(CH5BINS) $(CH5ASMBINS) $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
+	rm -f $(addsuffix .o,$(TESTASMBINS) $(CH5ASMBINS) $(CH6ASMBINS))
 
-.PHONY: all tests ch4 ch6 check clean
+.PHONY: all tests ch5 ch6 check clean

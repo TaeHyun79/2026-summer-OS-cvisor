@@ -8,9 +8,9 @@ cmake-build-debug/
 tests/*
 !tests/*.c
 !tests/*.s
-ch4/*
-!ch4/*.c
-!ch4/*.s
+ch5/*
+!ch5/*.c
+!ch5/*.s
 ch6/*
 !ch6/*.c
 !ch6/*.s
