@@ -12,7 +12,7 @@ the target environment, build flags, and on-screen layout are chosen so that
 what you see matches the textbook figures 1:1.
 
 ```
-┌─ showcase.c ─────────────┬─ disassembly ───────────────┐
+┌─ target.c ───────────────┬─ disassembly ───────────────┐
 │  5      if (n <= 1)      │  40113e: mov -0x4(%rbp),%eax│
 │> 6          return 1;    │> 401141: cmp $0x1,%eax      │
 ├─ registers ──────────────┼─ stack ─────────────────────┤
@@ -48,7 +48,7 @@ A native x86-64 Linux server over ssh works best if you have one.
 
 ```sh
 make            # build cvisor (needs libncurses-dev, libdw-dev)
-make tests      # build the example programs in tests/
+make ch5 ch6    # build the OSTEP chapter example programs
 make check      # quick smoke test
 ```
 
@@ -138,11 +138,14 @@ it uses the classic 2×2 layout with a single memory pane cycled by `Tab`.
 - addresses are stable across runs because ASLR is disabled for the child —
   a deliberate teaching setup, not how production systems behave
 
-## Example programs (tests/)
+## Example programs
 
-| File | What to watch |
-|---|---|
-| `showcase.c` | **start here** — one short run that changes every pane, phase by phase: register/EFLAGS churn, recursion frames, `.bss` writes, brk-heap fills, a 1 MB `mmap` region appearing and vanishing, the GOT flip + `write` syscall on the first `printf` (see its header comment) |
+- `ch5/` — OSTEP ch.5 process-API examples (fork/wait/exec); every pane of
+  the fork story is visible: clone in the syscall log, `P` to hop between
+  parent and child, the duplicated stdio buffer in the output panel.
+- `ch6/` — the ch.6 measurement homework (`syscall_cost`, `ctx_switch`);
+  build with `make ch6`, run the `-O2` binaries natively for numbers and
+  the `*_cv` builds under cvisor for mechanism-watching.
 
 ## Project layout
 
@@ -154,7 +157,7 @@ src/trace.c     trace storage, binary-search lookups, register/syscall tables
 src/dwarfvars.c variable names/types/locations from DWARF (libdw)
 src/tui.c       ncurses panels, overlays, status bar
 src/main.c      option parsing and orchestration
-tests/          example/verification programs
+ch5/, ch6/      OSTEP chapter example programs
 ```
 
 ## Roadmap
@@ -204,7 +207,7 @@ x86-64 리눅스 VM([Lima](https://lima-vm.io)나 UTM의 QEMU 전체 에뮬레�
 
 ```sh
 make            # cvisor 빌드 (libncurses-dev, libdw-dev 필요)
-make tests      # tests/ 예제 프로그램 빌드
+make ch5 ch6    # OSTEP 챕터 예제 프로그램 빌드
 make check      # 스모크 테스트
 ```
 
@@ -289,11 +292,14 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
 - 매 실행 같은 주소가 나오는 것은 자식 프로세스의 ASLR을 꺼서입니다 —
   학습용으로 의도된 설정이며, 실제 시스템 기본값과는 다릅니다
 
-## 예제 프로그램 (tests/)
+## 예제 프로그램
 
-| 파일 | 관찰 포인트 |
-|---|---|
-| `showcase.c` | **여기서 시작** — 한 번의 짧은 실행으로 모든 패널이 단계별로 변함: 레지스터/EFLAGS 변화, 재귀 프레임, `.bss` 쓰기, brk 힙 채우기, 1MB `mmap` 영역의 등장과 소멸, 첫 `printf`의 GOT 플립 + `write` 시스템 콜 (파일 상단 주석 참조) |
+- `ch5/` — OSTEP 5장 프로세스 API 예제(fork/wait/exec). syscall 로그의 clone,
+  `P`로 부모/자식 넘나들기, 출력 패널의 복제된 stdio 버퍼까지 fork 이야기의
+  전 장면이 보입니다.
+- `ch6/` — 6장 측정 숙제(`syscall_cost`, `ctx_switch`). `make ch6`로 빌드,
+  수치는 `-O2` 바이너리를 네이티브에서, 메커니즘 관찰은 `*_cv` 빌드를
+  cvisor로.
 
 ## 코드 구조
 
@@ -305,7 +311,7 @@ src/trace.c     트레이스 저장, 이진탐색 조회, 레지스터/시스템
 src/dwarfvars.c DWARF에서 변수 이름/타입/위치 추출 (libdw)
 src/tui.c       ncurses 패널·오버레이·상태바
 src/main.c      옵션 파싱 및 오케스트레이션
-tests/          예제/검증 프로그램
+ch5/, ch6/      OSTEP 챕터 예제 프로그램
 ```
 
 ## 로드맵

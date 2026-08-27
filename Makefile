@@ -7,10 +7,8 @@ SRCS := src/main.c src/analyzer.c src/recorder.c src/trace.c src/tui.c \
         src/dwarfvars.c
 OBJS := $(SRCS:.c=.o)
 
-# test targets: OSTEP-compatible build flags are mandatory (spec §4)
+# observation targets: OSTEP-compatible build flags are mandatory (spec §4)
 TESTCFLAGS := -g -O0 -no-pie -fno-omit-frame-pointer
-TESTSRCS   := $(wildcard tests/*.c)
-TESTBINS   := $(TESTSRCS:.c=)
 
 # libc-free assembly targets: entry is _start, syscalls are written by hand.
 # `as -g` is what emits the DWARF line table cvisor requires (spec §6.1) —
@@ -19,8 +17,6 @@ TESTBINS   := $(TESTSRCS:.c=)
 AS         ?= as
 LD         ?= ld
 ASFLAGS    ?= -g
-TESTASMSRCS := $(wildcard tests/*.s)
-TESTASMBINS := $(TESTASMSRCS:.s=)
 
 # ch5 example programs: cvisor-observation builds only
 CH5SRCS := $(wildcard ch5/*.c)
@@ -46,18 +42,9 @@ cvisor: $(OBJS)
 src/%.o: src/%.c src/cvisor.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-tests: $(TESTBINS) $(TESTASMBINS)
-
-tests/%: tests/%.c
-	$(CC) $(TESTCFLAGS) -o $@ $<
-
-# the source file must end up next to the binary: analyzer.c open_source()
-# looks for the CU path, then basename(CU) beside the target, then in cwd
-tests/%: tests/%.s
-	$(AS) $(ASFLAGS) -o $@.o $<
-	$(LD) -o $@ $@.o
-	rm -f $@.o
-
+# NOTE: the source file must end up next to the binary — analyzer.c
+# open_source() looks for the CU path, then basename(CU) beside the
+# target, then in cwd.
 ch5: $(CH5BINS) $(CH5ASMBINS)
 
 ch5/%: ch5/%.c
@@ -81,14 +68,13 @@ ch6/%: ch6/%.s
 	$(LD) -o $@ $@.o
 	rm -f $@.o
 
-check: cvisor tests
-	./cvisor --dump tests/showcase > /dev/null && echo "dump: OK"
-	./cvisor --trace tests/showcase | tail -3
-	./cvisor --trace --from-main tests/showcase | tail -3
+check: cvisor ch5
+	./cvisor --dump ch5/p1 > /dev/null && echo "dump: OK"
+	./cvisor --trace --from-main ch5/p1 | tail -3
 
 clean:
-	rm -f cvisor $(OBJS) $(TESTBINS) $(TESTASMBINS) \
+	rm -f cvisor $(OBJS) \
 	      $(CH5BINS) $(CH5ASMBINS) $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
-	rm -f $(addsuffix .o,$(TESTASMBINS) $(CH5ASMBINS) $(CH6ASMBINS))
+	rm -f $(addsuffix .o,$(CH5ASMBINS) $(CH6ASMBINS))
 
-.PHONY: all tests ch5 ch6 check clean
+.PHONY: all ch5 ch6 check clean
