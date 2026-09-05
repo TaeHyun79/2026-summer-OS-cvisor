@@ -34,6 +34,10 @@ CH6CV   := $(CH6SRCS:.c=_cv)
 CH6ASMSRCS := $(wildcard ch6/*.s)
 CH6ASMBINS := $(CH6ASMSRCS:.s=)
 
+# ch13 address-space examples: cvisor-observation builds only (like ch5)
+CH13SRCS := $(wildcard ch13/*.c)
+CH13BINS := $(CH13SRCS:.c=)
+
 all: cvisor
 
 cvisor: $(OBJS)
@@ -68,13 +72,19 @@ ch6/%: ch6/%.s
 	$(LD) -o $@ $@.o
 	rm -f $@.o
 
+ch13: $(CH13BINS)
+
+ch13/%: ch13/%.c
+	$(CC) $(TESTCFLAGS) -Wall -Wextra -o $@ $<
+
 check: cvisor ch5
 	./cvisor --dump ch5/p1 > /dev/null && echo "dump: OK"
 	./cvisor --trace --from-main ch5/p1 | tail -3
 
 clean:
 	rm -f cvisor $(OBJS) \
-	      $(CH5BINS) $(CH5ASMBINS) $(CH6BINS) $(CH6CV) $(CH6ASMBINS)
+	      $(CH5BINS) $(CH5ASMBINS) $(CH6BINS) $(CH6CV) $(CH6ASMBINS) \
+	      $(CH13BINS)
 	rm -f $(addsuffix .o,$(CH5ASMBINS) $(CH6ASMBINS))
 
-.PHONY: all ch5 ch6 check clean
+.PHONY: all ch5 ch6 ch13 check clean

@@ -11,6 +11,8 @@ ch5/*
 ch6/*
 !ch6/*.c
 !ch6/*.s
+ch13/*
+!ch13/*.c
 
 # machine-specific local VM config (kept out of the repo on purpose)
 vm/
