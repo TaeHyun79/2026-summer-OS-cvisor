@@ -41,6 +41,7 @@ enum {
     CP_TITLE,     /* panel titles */
     CP_BAD,       /* death signal in status bar */
     CP_VAR,       /* variable names/values (libdw) */
+    CP_STR,       /* printable-string runs under hex rows */
 };
 
 /* at most one overlay (bottom half of the screen) is open at a time */
@@ -325,43 +326,96 @@ static void mem_region(ui_t *u, int pane, uint64_t *base, size_t *len,
     }
 }
 
-/* one hex row of 8 bytes with per-byte change highlighting and an ASCII
- * column; sbuf != NULL means a static section (bytes from the ELF file,
- * never change) instead of per-step snapshots */
-static void draw_hex_row(ui_t *u, WINDOW *w, int y, uint64_t row_addr,
-                         uint64_t base, size_t len, const uint8_t *sbuf)
+/* byte fetch for hex rows: static sections (sbuf) read the ELF-file
+ * bytes, everything else the per-step snapshots */
+static int hexrow_byte(ui_t *u, const step_t *s, uint64_t a, uint64_t base,
+                       size_t len, const uint8_t *sbuf, uint8_t *out)
+{
+    if (a < base || a >= base + len)
+        return -1;
+    if (sbuf) {
+        *out = sbuf[a - base];
+        return 0;
+    }
+    return step_byte(u->t, s, a, out);
+}
+
+/* string detection for one hex row: a byte is part of a string when it
+ * sits in a printable run of 4+ chars.  Scans 3 bytes past both row
+ * edges so a string crossing rows keeps every piece.  Fills ch[8] (the
+ * characters) and in_str[8]; returns nonzero if the row has any. */
+static int hexrow_str(ui_t *u, uint64_t row_addr, uint64_t base, size_t len,
+                      const uint8_t *sbuf, char ch[8], int in_str[8])
+{
+    const step_t *s = cur_step(u);
+    int pr[14], run[14], any = 0;
+    for (int i = 0; i < 14; i++) {
+        uint8_t v;
+        uint64_t a = row_addr + (uint64_t)i - 3;
+        pr[i] = (row_addr + (uint64_t)i >= 3 &&
+                 hexrow_byte(u, s, a, base, len, sbuf, &v) == 0 &&
+                 v >= 0x20 && v < 0x7f);
+        if (pr[i] && i >= 3 && i < 11)
+            ch[i - 3] = (char)v;
+        run[i] = pr[i] ? (i ? run[i - 1] + 1 : 1) : 0;
+    }
+    for (int i = 12; i >= 0; i--)
+        if (pr[i] && run[i + 1] > run[i])
+            run[i] = run[i + 1];
+    for (int b = 0; b < 8; b++) {
+        in_str[b] = pr[b + 3] && run[b + 3] >= 4;
+        any |= in_str[b];
+    }
+    return any;
+}
+
+/* one hex row of 8 bytes with per-byte change highlighting; sbuf != NULL
+ * means a static section (bytes from the ELF file, never change) instead
+ * of per-step snapshots.  When the row holds a string (see hexrow_str)
+ * and a second line fits, its characters are drawn on the next line,
+ * column-aligned under their bytes.  Returns the number of lines used
+ * (1 or 2), leaving the cursor at the end of the hex line so callers
+ * can append markers/annotations to it. */
+static int draw_hex_row(ui_t *u, WINDOW *w, int y, uint64_t row_addr,
+                        uint64_t base, size_t len, const uint8_t *sbuf)
 {
     const step_t *s = cur_step(u), *p = prev_step(u);
-    char ascii[9] = "        ";
     mvwprintw(w, y, 1, "%012llx ", (unsigned long long)row_addr);
     for (int b = 0; b < 8; b++) {
         uint64_t a = row_addr + (uint64_t)b;
         uint8_t v;
-        int have, changed = 0;
-        if (a < base || a >= base + len) {
-            have = 0;
-        } else if (sbuf) {
-            v = sbuf[a - base];
-            have = 1;
-        } else {
-            have = (step_byte(u->t, s, a, &v) == 0);
+        int have = (hexrow_byte(u, s, a, base, len, sbuf, &v) == 0);
+        int changed = 0;
+        if (have && !sbuf) {
             uint8_t pv;
-            changed = (have && u->cur > 0 &&
+            changed = (u->cur > 0 &&
                        (step_byte(u->t, p, a, &pv) < 0 || pv != v));
         }
         if (!have) {
             wprintw(w, " ..");
             continue;
         }
-        ascii[b] = (v >= 0x20 && v < 0x7f) ? (char)v : '.';
         if (changed)
             wattron(w, COLOR_PAIR(CP_CHG) | A_BOLD);
         wprintw(w, " %02x", v);
         if (changed)
             wattroff(w, COLOR_PAIR(CP_CHG) | A_BOLD);
     }
-    if (getmaxx(w) - 2 >= 13 + 24 + 2 + 8)
-        wprintw(w, "  %s", ascii);
+
+    char ch[8];
+    int in_str[8];
+    if (y + 1 > getmaxy(w) - 2 ||
+        !hexrow_str(u, row_addr, base, len, sbuf, ch, in_str))
+        return 1;
+    int hex_end = getcurx(w);
+    wattron(w, COLOR_PAIR(CP_STR) | A_BOLD);
+    for (int b = 0; b < 8; b++)
+        if (in_str[b]) /* under the byte's hex digits: " %02x" columns */
+            mvwaddch(w, y + 1, 14 + 3 * b + 1,
+                     (chtype)(unsigned char)ch[b]);
+    wattroff(w, COLOR_PAIR(CP_STR) | A_BOLD);
+    wmove(w, y, hex_end);
+    return 2;
 }
 
 /* heap pane: [heap] plus tracked anonymous mmap regions, stacked */
@@ -395,21 +449,24 @@ static void draw_mem_heap(ui_t *u, WINDOW *w, int focus)
         first = 0;
     u->mem_scroll[PANE_HEAP] = first;
 
-    for (int i = 0; i < h && first + i < total; i++) {
-        int vrow = first + i, r = 0;
+    int line = 1;
+    for (int vrow = first; line <= h && vrow < total; vrow++) {
+        int r = 0;
         while (r + 1 < s->n_heapr && reg_first[r + 1] <= vrow)
             r++;
         const heapreg_t *hr = &s->heapr[r];
         int inner = vrow - reg_first[r];
         if (inner == 0) {
             wattron(w, COLOR_PAIR(CP_MARK) | A_BOLD);
-            mvwprintw(w, 1 + i, 1, "== %s 0x%llx (%zu bytes) ==",
+            mvwprintw(w, line, 1, "== %s 0x%llx (%zu bytes) ==",
                       r == 0 ? "region" : "mmap",
                       (unsigned long long)hr->base, hr->len);
             wattroff(w, COLOR_PAIR(CP_MARK) | A_BOLD);
+            line++;
         } else {
             uint64_t row_addr = hr->base + (uint64_t)(inner - 1) * 8;
-            draw_hex_row(u, w, 1 + i, row_addr, hr->base, hr->len, NULL);
+            line += draw_hex_row(u, w, line, row_addr, hr->base, hr->len,
+                                 NULL);
         }
     }
     wnoutrefresh(w);
@@ -465,16 +522,18 @@ static void draw_mem_one(ui_t *u, WINDOW *w, int pane, int focus)
         first = 0;
     u->mem_scroll[pane] = first - center_first(anchor_disp, nrows, h);
 
-    for (int i = 0; i < h && first + i < nrows; i++) {
-        int disp = first + i;
+    int line = 1;
+    for (int disp = first; line <= h && disp < nrows; disp++) {
         int rowi = descending ? nrows - 1 - disp : disp;
         uint64_t row_addr = lo + (uint64_t)rowi * 8;
 
         const uint8_t *sbuf =
             (pane == PANE_CODE)   ? cur_img(u)->text_bytes :
             (pane == PANE_RODATA) ? cur_img(u)->rodata_bytes : NULL;
-        draw_hex_row(u, w, 1 + i, row_addr, base, len, sbuf);
+        line += draw_hex_row(u, w, line, row_addr, base, len, sbuf);
 
+        /* markers/annotations append to the hex line — draw_hex_row
+         * leaves the cursor there even when it drew a string line */
         /* RSP/RBP markers on the stack, RIP marker on the code bytes */
         if (pane == PANE_STACK) {
             int has_rsp = s->regs.rsp >= row_addr && s->regs.rsp < row_addr + 8;
@@ -936,6 +995,7 @@ int tui_run(trace_t *t)
         init_pair(CP_TITLE, COLOR_CYAN,  -1);
         init_pair(CP_BAD,   COLOR_RED,   -1);
         init_pair(CP_VAR,   COLOR_GREEN, -1);
+        init_pair(CP_STR,   COLOR_MAGENTA, -1);
     }
 
     ui_t u = { .t = t, .cur = 0, .stack_desc = 1 };
