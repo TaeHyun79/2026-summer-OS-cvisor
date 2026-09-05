@@ -70,6 +70,8 @@ typedef struct {
     uint32_t size;       /* byte size, 0 = unknown/aggregate */
     int      enc;        /* DW_ATE_* encoding, 0 = unknown */
     int      is_ptr;
+    int      is_char;    /* scalar char (signed/unsigned char encoding) */
+    uint32_t asize;      /* char array: total bytes (0 = not one) */
 } dvar_t;
 
 /* one function's scope: [lo, hi) plus how to compute its frame base.

@@ -120,7 +120,11 @@ it uses the classic 2×2 layout with a single memory pane cycled by `Tab`.
   When a hex row contains an actual string — a run of 4+ printable
   characters, even one crossing row boundaries — the characters appear on
   the next line in magenta, column-aligned under their bytes; rows of
-  byte noise get no ASCII decoration at all. (`.text`/`.rodata` are
+  byte noise get no ASCII decoration at all. Bytes belonging to a
+  variable DWARF declares as `char`/`char[N]` are characters *by type*,
+  so they are shown (in green) at any length — a single `char c = 'A'`
+  included — and char arrays render their content in annotations and the
+  `v` panel as `buf="hi"` instead of `<agg>`. (`.text`/`.rodata` are
   read-only mappings, loaded once from the ELF file.)
 - **fork is followed**: every child gets its own step stream, and a global
   sequence number preserves the real interleaving. `P` switches between
@@ -278,8 +282,11 @@ gcc -g -O0 -no-pie -fno-omit-frame-pointer -o target target.c
   `<-RIP` 마커와 함께 보여줍니다. hex 행에 실제 문자열 — 4자 이상 이어지는
   printable run, 행 경계를 넘는 것 포함 — 이 있으면 그 문자들이 바로 아랫줄에
   각 바이트 위치에 열을 맞춰 magenta로 표시됩니다. 의미 없는 바이트만 있는
-  행에는 ASCII 표시가 붙지 않습니다. (`.text`/`.rodata`는 읽기 전용 매핑이라
-  ELF 파일에서 1회만 로드)
+  행에는 ASCII 표시가 붙지 않습니다. DWARF가 `char`/`char[N]` 타입이라고
+  선언한 변수의 바이트는 **타입상 문자**이므로 run 길이와 무관하게 green으로
+  표시되며(`char c = 'A'` 하나도 보임), char 배열은 주석과 `v` 패널에서
+  `<agg>` 대신 `buf="hi"`처럼 내용이 렌더링됩니다. (`.text`/`.rodata`는
+  읽기 전용 매핑이라 ELF 파일에서 1회만 로드)
 - **fork를 따라갑니다**: 자식마다 독립된 스텝 스트림이 생기고, 전역 순서번호가
   실제 인터리빙을 보존합니다. `P`로 프로세스를 전환하면 시간상 가장 가까운
   스텝으로 이동해 "그 순간 다른 프로세스는 어디였나"를 대조할 수 있습니다

@@ -63,6 +63,8 @@ static void resolve_type(Dwarf_Die *var, dvar_t *out)
             if (dwarf_attr_integrate(t, DW_AT_encoding, &a) &&
                 dwarf_formudata(&a, &w) == 0)
                 out->enc = (int)w;
+            out->is_char = (out->enc == DW_ATE_signed_char ||
+                            out->enc == DW_ATE_unsigned_char);
             if (tag == DW_TAG_enumeration_type) {
                 out->enc = DW_ATE_signed;
                 if (!name)
@@ -75,6 +77,27 @@ static void resolve_type(Dwarf_Die *var, dvar_t *out)
             if (!name)
                 name = "union";
         } else if (tag == DW_TAG_array_type) {
+            /* char arrays are shown as strings: record their total size
+             * (other aggregates keep size 0 and stay opaque) */
+            Dwarf_Die e_mem, *e = t;
+            for (int d = 0; d < 8; d++) {
+                if (!dwarf_attr_integrate(e, DW_AT_type, &a) ||
+                    !dwarf_formref_die(&a, &e_mem))
+                    break;
+                e = &e_mem;
+                int etag = dwarf_tag(e);
+                if (etag == DW_TAG_typedef || etag == DW_TAG_const_type ||
+                    etag == DW_TAG_volatile_type)
+                    continue;
+                Dwarf_Word w;
+                if (etag == DW_TAG_base_type &&
+                    dwarf_attr_integrate(e, DW_AT_encoding, &a) &&
+                    dwarf_formudata(&a, &w) == 0 &&
+                    (w == DW_ATE_signed_char || w == DW_ATE_unsigned_char) &&
+                    dwarf_aggregate_size(t, &w) == 0)
+                    out->asize = (uint32_t)w;
+                break;
+            }
             if (!name)
                 name = "array";
         }
@@ -85,10 +108,15 @@ static void resolve_type(Dwarf_Die *var, dvar_t *out)
         out->is_ptr = 1;
         out->size = 8;
         out->enc = 0;
+        out->is_char = 0;
+        out->asize = 0; /* pointer-to-array is just a pointer */
     }
-    snprintf(out->type, sizeof(out->type), "%s%.*s",
-             name ? name : (ptr ? "void" : "?"),
-             ptr > 8 ? 8 : ptr, "********");
+    if (out->asize)
+        snprintf(out->type, sizeof(out->type), "char[%u]", out->asize);
+    else
+        snprintf(out->type, sizeof(out->type), "%s%.*s",
+                 name ? name : (ptr ? "void" : "?"),
+                 ptr > 8 ? 8 : ptr, "********");
 }
 
 /* ---------------- location decoding ---------------- */

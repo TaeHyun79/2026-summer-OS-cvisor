@@ -94,6 +94,30 @@ static const image_t *cur_img(ui_t *u)
 
 /* ---------------- variable views (libdw) ---------------- */
 
+/* render a char array as a quoted string from a step's snapshots: bytes
+ * up to the first NUL (or the array/display limit), non-printables as
+ * '.'; fails only when the very first byte is unreadable */
+static int fmt_cstr(const trace_t *t, const step_t *s, uint64_t addr,
+                    uint32_t size, char *out, size_t cap)
+{
+    size_t o = 0;
+    out[o++] = '"';
+    for (uint32_t i = 0; i < size && o < cap - 2; i++) {
+        uint8_t b;
+        if (step_byte(t, s, addr + i, &b) < 0) {
+            if (i == 0)
+                return -1;
+            break;
+        }
+        if (b == 0)
+            break;
+        out[o++] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+    return 0;
+}
+
 static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
                          varview_t *vv)
 {
@@ -103,6 +127,23 @@ static void fill_varview(ui_t *u, const dfunc_t *f, const dvar_t *v,
     vv->addr = dvar_addr(f, v, s->regs.rbp);
     vv->has_val = 0;
     vv->changed = 0;
+    if (v->asize) { /* char array: value is the string content */
+        vv->has_val = (fmt_cstr(t, s, vv->addr, v->asize, vv->val,
+                                sizeof(vv->val)) == 0);
+        if (!vv->has_val)
+            snprintf(vv->val, sizeof(vv->val), "?");
+        uint64_t paddr = dvar_addr(f, v, p->regs.rbp);
+        for (uint32_t i = 0; u->cur > 0 && i < v->asize; i++) {
+            uint8_t b, pb;
+            int r = step_byte(t, s, vv->addr + i, &b);
+            int pr = step_byte(t, p, paddr + i, &pb);
+            if (r != pr || (r == 0 && b != pb)) {
+                vv->changed = 1;
+                break;
+            }
+        }
+        return;
+    }
     uint64_t raw, praw;
     if (step_read(t, s, vv->addr, v->size, &raw) == 0) {
         vv->has_val = 1;
@@ -340,12 +381,14 @@ static int hexrow_byte(ui_t *u, const step_t *s, uint64_t a, uint64_t base,
     return step_byte(u->t, s, a, out);
 }
 
-/* string detection for one hex row: a byte is part of a string when it
- * sits in a printable run of 4+ chars.  Scans 3 bytes past both row
- * edges so a string crossing rows keeps every piece.  Fills ch[8] (the
- * characters) and in_str[8]; returns nonzero if the row has any. */
+/* string detection for one hex row.  A byte is worth showing as a char
+ * when (a) it sits in a printable run of 4+ chars — the statistical
+ * test, scanning 3 bytes past both row edges so a string crossing rows
+ * keeps every piece — or (b) it belongs to a variable DWARF declares as
+ * char / char array: those are characters by type, any length.  Fills
+ * ch[8] and kind[8] (0 none, 1 run, 2 typed); returns nonzero if any. */
 static int hexrow_str(ui_t *u, uint64_t row_addr, uint64_t base, size_t len,
-                      const uint8_t *sbuf, char ch[8], int in_str[8])
+                      const uint8_t *sbuf, char ch[8], int kind[8])
 {
     const step_t *s = cur_step(u);
     int pr[14], run[14], any = 0;
@@ -363,8 +406,21 @@ static int hexrow_str(ui_t *u, uint64_t row_addr, uint64_t base, size_t len,
         if (pr[i] && run[i + 1] > run[i])
             run[i] = run[i + 1];
     for (int b = 0; b < 8; b++) {
-        in_str[b] = pr[b + 3] && run[b + 3] >= 4;
-        any |= in_str[b];
+        kind[b] = pr[b + 3] && run[b + 3] >= 4;
+        any |= kind[b];
+    }
+    for (int k = 0; k < u->n_vvs; k++) {
+        const dvar_t *v = u->vvs[k].v;
+        uint32_t n = v->asize ? v->asize : (v->is_char ? v->size : 0);
+        if (!n)
+            continue;
+        for (int b = 0; b < 8; b++) {
+            uint64_t a = row_addr + (uint64_t)b;
+            if (a >= u->vvs[k].addr && a < u->vvs[k].addr + n && pr[b + 3]) {
+                kind[b] = 2;
+                any = 1;
+            }
+        }
     }
     return any;
 }
@@ -403,17 +459,20 @@ static int draw_hex_row(ui_t *u, WINDOW *w, int y, uint64_t row_addr,
     }
 
     char ch[8];
-    int in_str[8];
+    int kind[8];
     if (y + 1 > getmaxy(w) - 2 ||
-        !hexrow_str(u, row_addr, base, len, sbuf, ch, in_str))
+        !hexrow_str(u, row_addr, base, len, sbuf, ch, kind))
         return 1;
     int hex_end = getcurx(w);
-    wattron(w, COLOR_PAIR(CP_STR) | A_BOLD);
-    for (int b = 0; b < 8; b++)
-        if (in_str[b]) /* under the byte's hex digits: " %02x" columns */
-            mvwaddch(w, y + 1, 14 + 3 * b + 1,
-                     (chtype)(unsigned char)ch[b]);
-    wattroff(w, COLOR_PAIR(CP_STR) | A_BOLD);
+    for (int b = 0; b < 8; b++) {
+        if (!kind[b])
+            continue;
+        /* magenta: statistical run; green: char by DWARF type */
+        int attr = COLOR_PAIR(kind[b] == 2 ? CP_VAR : CP_STR) | A_BOLD;
+        wattron(w, attr); /* under the byte's hex digits: " %02x" cols */
+        mvwaddch(w, y + 1, 14 + 3 * b + 1, (chtype)(unsigned char)ch[b]);
+        wattroff(w, attr);
+    }
     wmove(w, y, hex_end);
     return 2;
 }
@@ -727,7 +786,8 @@ static void draw_vars(ui_t *u)
                                 : COLOR_PAIR(CP_VAR);
         wattron(w, vattr);
         wprintw(w, "%-22.22s",
-                vv->has_val ? vv->val : (v->size ? "?" : "<agg>"));
+                vv->has_val ? vv->val
+                            : (v->size || v->asize) ? "?" : "<agg>");
         wattroff(w, vattr);
         wattron(w, A_DIM);
         wprintw(w, " @ %-.*s", width - getcurx(w) - 1, loc);
